@@ -21,20 +21,21 @@ AWSリソースはAWS CDKで管理する。
 
 PoCでは以下のAWSサービスを利用する。
 
-| 用途               | AWSサービス                               |
-| ------------------ | ----------------------------------------- |
-| フロントエンド配信 | Amazon S3                                 |
-| CDN                | Amazon CloudFront                         |
-| REST API           | Amazon API Gateway                        |
-| API処理            | AWS Lambda                                |
-| データ収集         | AWS Lambda                                |
-| コメント分析       | AWS Lambda                                |
-| 非同期処理         | Amazon SQS                                |
-| Raw Data保存       | Amazon S3                                 |
-| 分析結果保存       | Amazon Aurora Serverless v2 PostgreSQL    |
-| シークレット管理   | AWS Secrets Manager / SSM Parameter Store |
-| ログ・監視         | Amazon CloudWatch                         |
-| IaC                | AWS CDK                                   |
+| 用途               | AWSサービス                            |
+| ------------------ | -------------------------------------- |
+| フロントエンド配信 | Amazon S3                              |
+| CDN                | Amazon CloudFront                      |
+| REST API           | Amazon API Gateway                     |
+| API処理            | AWS Lambda                             |
+| データ収集         | AWS Lambda                             |
+| コメント分析       | AWS Lambda                             |
+| 非同期処理         | Amazon SQS                             |
+| Raw Data保存       | Amazon S3                              |
+| 分析結果保存       | Amazon Aurora Serverless v2 PostgreSQL |
+| API Key管理        | AWS Systems Manager Parameter Store    |
+| OAuth認証情報管理  | AWS Secrets Manager                    |
+| ログ・監視         | Amazon CloudWatch                      |
+| IaC                | AWS CDK                                |
 
 ---
 
@@ -56,8 +57,9 @@ PoCでは以下のAWSサービスを利用する。
 
 
 YouTube Data API
+       ▲
+       │ OAuth 2.0
        │
-       ▼
 ┌─────────────────────┐
 │ Data Collector      │
 │ Lambda              │
@@ -151,6 +153,25 @@ PoCではコスト削減のため、
 外部APIアクセスが必要なLambdaと、
 Auroraアクセスが必要なLambdaの責務を分離する。
 
+Analyzer Lambda等のVPC内LambdaからAWSサービスへアクセスする場合は、
+必要に応じてVPC Endpointを利用する。
+
+例：
+
+```text
+VPC
+├── Private Subnet
+│   ├── Analyzer Lambda
+│   ├── API Lambda
+│   └── Aurora
+│
+├── S3 Gateway Endpoint
+└── 必要なVPC Endpoint
+```
+
+具体的なVPC Endpoint構成については、
+CDK実装時に必要な通信経路を確認したうえで決定する。
+
 ---
 
 ## 6. Lambda
@@ -162,6 +183,7 @@ PoCでは以下のLambda Functionを作成する。
 役割：
 
 - YouTube Data APIへのアクセス
+- OAuth 2.0 Access Tokenの取得・更新
 - 配信情報取得
 - Live Chat ID取得
 - コメント取得
@@ -175,6 +197,8 @@ stream-insight-data-collector
 
 Data Collector LambdaはYouTube Data APIへアクセスするため、
 インターネットアクセス可能な構成とする。
+
+OAuth 2.0の認可情報はAWS Secrets Managerから取得する。
 
 ---
 
@@ -421,16 +445,15 @@ CloudFrontからFrontend S3へアクセスする。
 
 ## 12. シークレット管理
 
-YouTube Data API Key等のシークレット情報は、
+YouTube Data API KeyやOAuth 2.0認証情報等のシークレット情報は、
 ソースコードやGitHub Repositoryへ保存しない。
 
-以下の利用を検討する。
+情報の性質に応じて、
+AWS Systems Manager Parameter StoreとAWS Secrets Managerを使い分ける。
 
-- AWS Secrets Manager
-- AWS Systems Manager Parameter Store
+### 12.1. YouTube Data API Key
 
-PoCでは利用料金と実装の単純さを考慮し、
-Parameter Storeの利用を第一候補とする。
+YouTube Data API KeyはParameter Storeで管理する。
 
 例：
 
@@ -438,7 +461,59 @@ Parameter Storeの利用を第一候補とする。
 /stream-insight/youtube/api-key
 ```
 
-LambdaはIAM Role経由でParameter Storeへアクセスする。
+Data Collector LambdaはIAM Role経由でParameter Storeへアクセスする。
+
+---
+
+### 12.2. YouTube OAuth 2.0
+
+YouTube Live Chat取得にOAuth 2.0認可が必要となるため、
+Data Collector Lambdaから利用する認可情報を安全に管理する。
+
+PoCでは、初回認可は開発者または運用者が手動で実施する。
+
+認可フロー：
+
+```text
+Developer / Operator
+        ↓
+YouTube OAuth 2.0 Authorization
+        ↓
+Authorization Code
+        ↓
+Access Token / Refresh Token
+        ↓
+AWS Secrets Manager
+        ↓
+Data Collector Lambda
+        ↓
+YouTube Data API
+```
+
+以下の情報はGitHub Repositoryやソースコードへ保存しない。
+
+- OAuth Client ID
+- OAuth Client Secret
+- Refresh Token
+- Access Token
+
+OAuth Client情報およびRefresh TokenはAWS Secrets Managerで管理する。
+
+例：
+
+```text
+stream-insight/dev/youtube/oauth
+```
+
+Data Collector Lambdaには、
+対象Secretを取得するための最小限のIAM権限を付与する。
+
+Access TokenはRefresh Tokenを利用して必要に応じて更新する。
+
+Refresh Tokenの失効、認可取り消し等によってAccess Tokenを更新できない場合は、
+運用者が再度OAuth 2.0認可を実施する。
+
+PoCではOAuth 2.0認可画面および認可管理用Web UIは実装しない。
 
 ---
 
@@ -451,6 +526,7 @@ LambdaはIAM Role経由でParameter Storeへアクセスする。
 ```text
 SQS SendMessage
 SSM GetParameter
+Secrets Manager GetSecretValue
 CloudWatch Logs
 ```
 
@@ -489,6 +565,9 @@ LambdaのログはCloudWatch Logsへ出力する。
 - API Gateway 4xx
 - API Gateway 5xx
 - Auroraエラー
+- YouTube OAuth 2.0 Token更新エラー
+
+OAuth Client Secret、Refresh Token、Access Token等の認証情報はログへ出力しない。
 
 PoCではCloudWatch Alarmの作り込みは最低限とする。
 
@@ -536,6 +615,7 @@ PoCでは以下のStack構成を基本とする。
 - VPC
 - Subnet
 - Security Group
+- VPC Endpoint
 
 ### StorageStack
 
@@ -555,6 +635,7 @@ PoCでは以下のStack構成を基本とする。
 - API Lambda
 - API Gateway
 - Parameter Store
+- Secrets Manager
 
 ### FrontendStack
 
@@ -633,6 +714,7 @@ PoCでは以下を重視する。
 - NAT Gatewayを可能な限り使用しない
 - Auroraのキャパシティを必要最小限にする
 - CloudWatch Logsの不要な長期保存を避ける
+- Secrets Managerに保存するSecret数を必要最小限にする
 
 ---
 
@@ -645,9 +727,10 @@ PoC完了後、以下を検討する。
 - Amazon Bedrock
 - Amazon Athena
 - Amazon Cognito
-- WAF
+- AWS WAF
 - APIキー管理
 - Custom Domain
 - Route 53
 - CI/CD
 - dev / staging / prod環境分離
+- OAuth 2.0認可管理UI
