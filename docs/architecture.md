@@ -20,7 +20,7 @@ PoCでは、AWSのマネージドサービスおよびサーバレスサービ�
 
 ### 2.3. PoC優先
 
-PoCでは必要以上にAWSサービスを導入せず、最小構成で一連のデータフローを実現する。
+PoCでは必要以上にAWSサービスを導入せず、一連のデータフローを実現するために必要な構成に限定する。
 
 ### 2.4. 将来拡張
 
@@ -39,48 +39,56 @@ PoC後に以下へ拡張可能な構成とする。
 ```text
                          ┌──────────────────┐
                          │ YouTube Data API │
-                         └────────┬─────────┘
+                         └────────▲─────────┘
                                   │
-                                  ▼
-                         ┌──────────────────┐
+                                  │ OAuth 2.0
+                                  │
+                         ┌────────┴─────────┐
                          │     Lambda       │
                          │ Data Collector   │
-                         └────────┬─────────┘
-                                  │
-                                  ▼
-                         ┌──────────────────┐
-                         │      SQS         │
-                         └────────┬─────────┘
-                                  │
-                                  ▼
-                         ┌──────────────────┐
-                         │     Lambda       │
-                         │    Analyzer      │
-                         └───────┬──┬───────┘
-                                 │  │
-                    ┌────────────┘  └──────────┐
-                    ▼                          ▼
-           ┌──────────────────┐       ┌──────────────────┐
-           │       S3         │       │ Aurora Serverless│
-           │   Raw Comments   │       │   PostgreSQL     │
-           └──────────────────┘       │ Analysis Results │
-                                      └────────┬─────────┘
-                                               │
-                                               ▼
-                                      ┌──────────────────┐
-                                      │  API Gateway     │
-                                      └────────┬─────────┘
-                                               │
-                                               ▼
-                                      ┌──────────────────┐
-                                      │     Lambda       │
-                                      │    API Handler   │
-                                      └────────┬─────────┘
-                                               │
-                                               ▼
-                                      ┌──────────────────┐
-                                      │   Next.js / FE   │
-                                      └──────────────────┘
+                         └────────▲─┬───────┘
+                                  │ │
+                    Task Invoke   │ │ Comments
+                                  │ ▼
+                         ┌────────┴─────────┐
+                         │ Step Functions   │
+                         │ Collection       │
+                         │ Workflow         │
+                         └──────────────────┘
+                                      │
+                                      │
+                                      ▼
+                              ┌──────────────┐
+                              │     SQS      │
+                              └──────┬───────┘
+                                     │
+                                     ▼
+                            ┌──────────────────┐
+                            │     Lambda       │
+                            │    Analyzer      │
+                            └───────┬──┬───────┘
+                                    │  │
+                       ┌────────────┘  └────────────┐
+                       ▼                            ▼
+              ┌──────────────────┐         ┌──────────────────┐
+              │       S3         │         │ Aurora Serverless│
+              │   Raw Comments   │         │   PostgreSQL     │
+              └──────────────────┘         │ Analysis Results │
+                                           └────────┬─────────┘
+                                                    ▲
+                                                    │
+                                           ┌────────┴─────────┐
+                                           │     Lambda       │
+                                           │    API Handler   │
+                                           └────────▲─────────┘
+                                                    │
+                                           ┌────────┴─────────┐
+                                           │   API Gateway    │
+                                           └────────▲─────────┘
+                                                    │
+                                           ┌────────┴─────────┐
+                                           │   Next.js / FE   │
+                                           └──────────────────┘
 ```
 
 データ保存先を以下のように分離する。
@@ -90,7 +98,7 @@ PoC後に以下へ拡張可能な構成とする。
 
 大量のコメント原データをAuroraに保存せず、オブジェクトストレージであるS3に保存することで、データ量の増加に伴うデータベースコストを抑制する。
 
-一方、Web UIから頻繁に参照する分析結果はAuroraに保存し、APIから高速に取得できるようにする。
+一方、Web UIから頻繁に参照する分析結果はAuroraに保存し、APIから取得できるようにする。
 
 ---
 
@@ -98,7 +106,7 @@ PoC後に以下へ拡張可能な構成とする。
 
 ### 4.1. YouTube Data API
 
-YouTubeから以下の公開データを取得する。
+YouTubeから以下のデータを取得する。
 
 - YouTube Live配信情報
 - Live Chat情報
@@ -106,22 +114,99 @@ YouTubeから以下の公開データを取得する。
 
 取得にはYouTube Data APIを利用する。
 
+Live Chat取得に必要なAPIについてはOAuth 2.0認可を利用する。
+
 ---
 
-### 4.2. Data Collector Lambda
+### 4.2. AWS Step Functions
+
+YouTube Live Chatの継続的な収集処理を制御する。
+
+Lambdaには1回あたりの実行時間上限があるため、
+1つのData Collector Lambdaを配信終了まで実行し続ける方式は採用しない。
+
+Step FunctionsからData Collector Lambdaを繰り返し呼び出し、
+Live Chat取得を継続する。
+
+Step Functionsの実行状態には主に以下の情報を保持する。
+
+```text
+streamId
+videoId
+liveChatId
+nextPageToken
+pollingInterval
+collectionStatus
+```
+
+`nextPageToken`を次回のData Collector Lambda呼び出しへ引き継ぐことで、
+前回取得した位置からコメント取得を再開する。
+
+概念的な処理フロー：
+
+```text
+Start
+  ↓
+Data Collector Lambda
+  ↓
+コメント取得
+  ↓
+SQSへ送信
+  ↓
+nextPageToken取得
+  ↓
+配信終了？
+  ├─ Yes → End
+  │
+  └─ No
+      ↓
+     Wait
+      ↓
+Data Collector Lambda
+      ↓
+     ...
+```
+
+Wait時間はYouTube Data APIから取得できるポーリング間隔を考慮して決定する。
+
+一時的なエラーについてはStep FunctionsのRetry機能を利用する。
+
+配信またはLive Chatの終了を検知した場合はワークフローを終了する。
+
+一定回数のリトライ後も処理できない場合はワークフローを異常終了させ、
+CloudWatch Logs等から確認できるようにする。
+
+---
+
+### 4.3. Data Collector Lambda
 
 YouTube Data APIから対象配信のデータを取得する。
 
 主な責務：
 
+- OAuth 2.0 Access Tokenの取得
 - 配信情報取得
 - Live Chat ID取得
 - コメント取得
-- 取得したコメントデータのSQSへの送信
+- `nextPageToken`の取得
+- ポーリング間隔の取得
+- コメントデータのSQSへの送信
+- Step Functionsへの取得結果返却
+
+Data Collector Lambda自身では配信終了まで待機しない。
+
+1回のLambda実行では一定範囲のLive Chatを取得して処理を終了し、
+取得継続に必要な`nextPageToken`等をStep Functionsへ返却する。
+
+これによりLambdaの実行時間上限を超える長時間配信についても、
+複数回のLambda実行によってコメント取得を継続する。
+
+Data Collector LambdaはYouTube Data APIへアクセスする必要があるため、
+Auroraへ直接接続せず、VPC外で実行する構成を基本とする。
 
 ---
 
-### 4.3. Amazon SQS
+### 4.4. Amazon SQS
 
 データ収集処理と分析処理の間に配置する。
 
@@ -136,7 +221,7 @@ PoCでは、複数のコメントを1メッセージにまとめて送信する�
 
 ---
 
-### 4.4. Analyzer Lambda
+### 4.5. Analyzer Lambda
 
 SQSからコメントデータを取得し、
 原データの保存および分析処理を行う。
@@ -159,23 +244,24 @@ SQSからコメントデータを取得し、
 
 ---
 
-### 4.5. Amazon S3
+### 4.6. Amazon S3
 
 YouTube Liveから取得したコメント等の原データを保存する。
 
 主な用途：
 
 - コメント原データの保存
-- 将来的な再分析用データの保存
+- 保持期間内における再分析
 - 大量データの低コストな保存
 
-S3には主に分析処理の入力となる原データを保存し、Web UIから頻繁に参照する分析結果は保存しない。
+S3には主に分析処理の入力となる原データを保存し、
+Web UIから頻繁に参照する分析結果は保存しない。
 
-保存形式およびオブジェクト構成の詳細は`data-model.md`で定義する。
+保存形式、オブジェクト構成および保持期間の詳細は`data-model.md`で定義する。
 
 ---
 
-### 4.6. Aurora Serverless v2 PostgreSQL
+### 4.7. Aurora Serverless v2 PostgreSQL
 
 Web UIやAPIから利用する分析結果およびアプリケーションデータを保存する。
 
@@ -190,13 +276,14 @@ Web UIやAPIから利用する分析結果およびアプリケーションデ�
 
 大量のコメント原データはAuroraには保存せず、S3に保存する。
 
-PoCではリレーショナルデータベースを採用し、SQLによる集計・検索・比較を容易にする。
+PoCではリレーショナルデータベースを採用し、
+SQLによる集計・検索・比較を容易にする。
 
 保存対象の詳細は`data-model.md`で定義する。
 
 ---
 
-### 4.7. Amazon API Gateway
+### 4.8. Amazon API Gateway
 
 Web UIから利用するREST APIのエンドポイントを提供する。
 
@@ -206,9 +293,10 @@ PoCでは外部ユーザー向けAPI公開は対象外とする。
 
 ---
 
-### 4.8. API Lambda
+### 4.9. API Lambda
 
-API Gatewayからのリクエストを受け付け、Aurora PostgreSQLから分析結果を取得してレスポンスを返す。
+API Gatewayからのリクエストを受け付け、
+Aurora PostgreSQLから分析結果を取得してレスポンスを返す。
 
 主な責務：
 
@@ -219,7 +307,7 @@ API Gatewayからのリクエストを受け付け、Aurora PostgreSQLから分�
 
 ---
 
-### 4.9. Next.js
+### 4.10. Next.js
 
 分析結果をWeb UIとして表示する。
 
@@ -235,21 +323,60 @@ API Gatewayからのリクエストを受け付け、Aurora PostgreSQLから分�
 
 ## 5. データフロー
 
-### 5.1. データ収集
+### 5.1. データ収集開始
+
+PoCでは対象となる配信を指定してStep Functionsの収集ワークフローを開始する。
+
+ライブ配信そのものを自動検出してワークフローを開始する機能は、
+PoC完了後の拡張対象とする。
 
 ```text
-YouTube Data API
-       ↓
+Target Stream
+     ↓
+Step Functions
+     ↓
 Data Collector Lambda
-       ↓
-SQS
+     ↓
+YouTube Data API
 ```
-
-Data Collector LambdaがYouTube Data APIから対象配信のコメントを取得し、SQSへ送信する。
 
 ---
 
-### 5.2. データ保存・分析
+### 5.2. 継続的なコメント取得
+
+```text
+Step Functions
+       ↓
+Data Collector Lambda
+       ↓
+YouTube Data API
+       ↓
+Comments + nextPageToken
+       ↓
+       ├──────────────→ SQS
+       │
+       ▼
+Step Functions
+       ↓
+      Wait
+       ↓
+Data Collector Lambda
+       ↓
+      ...
+```
+
+Data Collector Lambdaは1回の実行で一定範囲のコメントを取得する。
+
+取得したコメントはSQSへ送信する。
+
+次回取得位置を示す`nextPageToken`はStep Functionsの実行状態として保持し、
+次回のLambda呼び出しへ引き継ぐ。
+
+この処理を配信またはLive Chatが終了するまで繰り返す。
+
+---
+
+### 5.3. データ保存・分析
 
 ```text
                      SQS
@@ -268,11 +395,13 @@ Analyzer LambdaがSQSからコメントデータを取得し、以下の処理�
 2. コメントデータを分析する
 3. 分析結果をAurora PostgreSQLへ保存する
 
-コメント原データと分析結果を保存先ごとに分離することで、大量のコメントデータを低コストで保持しながら、Web UIから必要な分析結果を高速に取得できる構成とする。
+コメント原データと分析結果を保存先ごとに分離することで、
+大量のコメントデータを低コストで保持しながら、
+Web UIから必要な分析結果を取得できる構成とする。
 
 ---
 
-### 5.3. Web UIからの参照
+### 5.4. Web UIからの参照
 
 ```text
 Next.js
@@ -285,6 +414,8 @@ Aurora PostgreSQL
    ↓
 API Lambda
    ↓
+API Gateway
+   ↓
 Next.js
 ```
 
@@ -294,13 +425,48 @@ PoCでは、Web UIからS3上のコメント原データを直接参照する機
 
 ---
 
-## 6. PoCにおける処理方式
+## 6. PoCにおけるコメント収集方式
 
-PoCでは、特定のYouTube Live配信を対象としてデータ収集から分析、Web表示までの一連の処理を検証する。
+PoCでは、特定のYouTube Live配信を対象として、
+データ収集から分析、Web表示までの一連の処理を検証する。
 
-ライブ配信の継続監視や定期的な配信検出は、PoC完了後の拡張対象とする。
+配信ごとにStep FunctionsのState Machine Executionを開始し、
+配信終了までコメント収集処理を継続する。
 
-コメントデータについては、取得した原データをS3へ保存し、Web UIで利用する分析結果をAurora PostgreSQLへ保存する。
+Data Collector Lambdaは短時間の処理単位として実行し、
+配信終了まで単一Lambdaを実行し続けない。
+
+### 6.1. 継続条件
+
+以下の条件を満たす間、コメント取得を継続する。
+
+- 対象Live Chatが有効である
+- 次回取得可能な状態である
+- ワークフローが異常終了していない
+
+### 6.2. 停止条件
+
+以下のいずれかを検知した場合、収集処理を終了する。
+
+- YouTube Live配信の終了
+- Live Chatの終了
+- APIから継続取得不能であることを検知
+- 設定したリトライ回数を超える継続的なエラー
+
+### 6.3. 再試行
+
+YouTube Data APIへのアクセスで一時的なエラーが発生した場合は、
+Step FunctionsのRetry機能を利用する。
+
+RetryではBackoffを設定し、
+短時間にAPIを過剰に呼び出さないようにする。
+
+### 6.4. 自動配信検出
+
+ライブ配信の自動検出および収集ワークフローの自動開始は、
+PoCでは対象外とする。
+
+PoC完了後、EventBridge等を利用した自動化を検討する。
 
 ---
 
@@ -308,19 +474,15 @@ PoCでは、特定のYouTube Live配信を対象としてデータ収集から�
 
 PoCでは以下のサービスを必須としない。
 
-### 7.1. EventBridge
+### 7.1. Amazon EventBridge
 
-ライブ配信の自動検出や定期的なコメント取得が必要になった段階で導入を検討する。
+ライブ配信の自動検出や収集ワークフローの自動開始が必要になった段階で導入を検討する。
 
-### 7.2. Step Functions
-
-複数の非同期処理や複雑なワークフローが必要になった段階で導入を検討する。
-
-### 7.3. Amazon Bedrock
+### 7.2. Amazon Bedrock
 
 高度なAI分析を実装する段階で導入を検討する。
 
-### 7.4. Amazon Cognito
+### 7.3. Amazon Cognito
 
 ユーザーアカウント機能を実装する段階で導入を検討する。
 
@@ -357,9 +519,12 @@ CloudFront
 
 - TypeScript
 - AWS Lambda
-- API Gateway
+- AWS Step Functions
+- Amazon API Gateway
+- Amazon SQS
 
-PoCではサーバレス構成を優先し、常時稼働するアプリケーションサーバは使用しない。
+PoCではサーバレス構成を優先し、
+常時稼働するアプリケーションサーバは使用しない。
 
 ---
 
@@ -367,7 +532,7 @@ PoCではサーバレス構成を優先し、常時稼働するアプリケー�
 
 AWSリソースはInfrastructure as Codeで管理する。
 
-PoCではAWS CDKの利用を想定する。
+PoCではAWS CDKを利用する。
 
 ```text
 infrastructure/
@@ -376,6 +541,8 @@ infrastructure/
 └── cdk.json
 ```
 
+詳細は`infrastructure.md`で定義する。
+
 ---
 
 ## 11. 将来の拡張
@@ -383,7 +550,7 @@ infrastructure/
 PoC完了後、以下の拡張を検討する。
 
 - EventBridgeによるライブ配信自動検出
-- Step Functionsによるデータ収集ワークフロー管理
+- データ収集ワークフローの高度化
 - AIによるコメント傾向分析
 - 「読まれたコメント」の推定
 - メンバー・非メンバー分析

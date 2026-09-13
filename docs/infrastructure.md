@@ -28,6 +28,7 @@ PoCでは以下のAWSサービスを利用する。
 | REST API           | Amazon API Gateway                     |
 | API処理            | AWS Lambda                             |
 | データ収集         | AWS Lambda                             |
+| コメント収集制御   | AWS Step Functions                     |
 | コメント分析       | AWS Lambda                             |
 | 非同期処理         | Amazon SQS                             |
 | Raw Data保存       | Amazon S3                              |
@@ -56,45 +57,56 @@ PoCでは以下のAWSサービスを利用する。
                       └─────────────────┘
 
 
-YouTube Data API
-       ▲
-       │ OAuth 2.0
-       │
-┌─────────────────────┐
-│ Data Collector      │
-│ Lambda              │
-└──────────┬──────────┘
-           │
-           ▼
-      ┌─────────┐
-      │   SQS   │
-      └────┬────┘
-           │
-           ▼
-┌─────────────────────┐
-│ Analyzer Lambda     │
-└──────────┬──────────┘
-           │
-      ┌────┴────┐
-      ▼         ▼
-┌──────────┐ ┌────────────────────┐
-│ S3 Raw   │ │ Aurora Serverless  │
-│ Data     │ │ PostgreSQL         │
-└──────────┘ └─────────┬──────────┘
-                       │
-                       ▼
-                ┌─────────────┐
-                │ API Lambda  │
-                └──────┬──────┘
-                       │
-                       ▼
-                ┌─────────────┐
-                │ API Gateway │
-                └──────┬──────┘
-                       │
-                       ▼
-                    Next.js
+                      ┌─────────────────┐
+                      │ Step Functions  │
+                      │ Collection      │
+                      │ Workflow        │
+                      └────────┬────────┘
+                               │
+                               ▼
+                      ┌─────────────────┐
+                      │ Data Collector  │
+                      │ Lambda          │
+                      └───────┬─────────┘
+                              │ OAuth 2.0
+                              ▼
+                      ┌─────────────────┐
+                      │ YouTube Data API│
+                      └─────────────────┘
+                              │
+                              │ Comments
+                              ▼
+                         ┌─────────┐
+                         │   SQS   │
+                         └────┬────┘
+                              │
+                              ▼
+                     ┌─────────────────┐
+                     │ Analyzer Lambda │
+                     └────────┬────────┘
+                              │
+                         ┌────┴─────┐
+                         ▼          ▼
+                  ┌──────────┐ ┌────────────────────┐
+                  │ S3 Raw   │ │ Aurora Serverless  │
+                  │ Data     │ │ PostgreSQL         │
+                  └──────────┘ └─────────▲──────────┘
+                                         │
+                                  ┌──────┴──────┐
+                                  │ API Lambda  │
+                                  └──────▲──────┘
+                                         │
+                                  ┌──────┴──────┐
+                                  │ API Gateway │
+                                  └──────▲──────┘
+                                         │
+                                      Next.js
 ```
+
+Step FunctionsはData Collector Lambdaを繰り返し呼び出し、
+配信終了までLive Chat取得を継続する。
+
+Data Collector Lambdaは単一実行で配信終了まで待機しない。
 
 ---
 
@@ -131,12 +143,34 @@ VPC
 
 PoCではAuroraをPrivate Subnetへ配置する。
 
-LambdaからAuroraへアクセスする必要があるため、
-DBアクセスを行うLambdaもVPC内へ配置する。
+Auroraへ直接アクセスするLambdaについてもVPC内へ配置する。
 
 ---
 
-### 5.2. Public Subnet
+### 5.2. Lambda配置方針
+
+Lambdaの責務に応じてVPC内外を分離する。
+
+```text
+VPC外
+└── Data Collector Lambda
+      ↓
+   YouTube Data API
+
+VPC内
+├── Analyzer Lambda
+├── API Lambda
+└── Aurora PostgreSQL
+```
+
+Data Collector LambdaはAuroraへ直接接続しない。
+
+これによりData Collector LambdaはVPC外からYouTube Data APIへアクセスでき、
+YouTube Data APIアクセスのためだけにNAT Gatewayを配置することを避ける。
+
+---
+
+### 5.3. Public Subnet
 
 PoCでは原則としてPublic Subnet上にEC2等のサーバーは配置しない。
 
@@ -145,15 +179,12 @@ PoCでは原則としてPublic Subnet上にEC2等のサーバーは配置しな�
 
 ---
 
-### 5.3. NAT Gateway
+### 5.4. NAT Gateway
 
 PoCではコスト削減のため、
-可能な限りNAT Gatewayを使用しない構成を検討する。
+可能な限りNAT Gatewayを使用しない。
 
-外部APIアクセスが必要なLambdaと、
-Auroraアクセスが必要なLambdaの責務を分離する。
-
-Analyzer Lambda等のVPC内LambdaからAWSサービスへアクセスする場合は、
+VPC内LambdaからAWSサービスへアクセスする場合は、
 必要に応じてVPC Endpointを利用する。
 
 例：
@@ -166,11 +197,10 @@ VPC
 │   └── Aurora
 │
 ├── S3 Gateway Endpoint
-└── 必要なVPC Endpoint
+└── 必要なInterface VPC Endpoint
 ```
 
-具体的なVPC Endpoint構成については、
-CDK実装時に必要な通信経路を確認したうえで決定する。
+必要となるVPC EndpointはCDK実装時に通信経路を確認したうえで決定する。
 
 ---
 
@@ -183,11 +213,14 @@ PoCでは以下のLambda Functionを作成する。
 役割：
 
 - YouTube Data APIへのアクセス
-- OAuth 2.0 Access Tokenの取得・更新
+- OAuth 2.0 Access Tokenの取得
 - 配信情報取得
 - Live Chat ID取得
 - コメント取得
+- `nextPageToken`取得
+- ポーリング間隔取得
 - SQSへのコメントデータ送信
+- Step Functionsへの取得結果返却
 
 想定Function名：
 
@@ -196,9 +229,12 @@ stream-insight-data-collector
 ```
 
 Data Collector LambdaはYouTube Data APIへアクセスするため、
-インターネットアクセス可能な構成とする。
+VPC外へ配置する。
 
-OAuth 2.0の認可情報はAWS Secrets Managerから取得する。
+配信終了まで単一のLambdaを実行し続けず、
+1回の実行では一定範囲のコメント取得のみを行う。
+
+継続取得に必要な`nextPageToken`等はStep Functionsへ返却する。
 
 ---
 
@@ -218,6 +254,8 @@ OAuth 2.0の認可情報はAWS Secrets Managerから取得する。
 stream-insight-analyzer
 ```
 
+Auroraへの接続が必要となるためVPC内へ配置する。
+
 ---
 
 ### 6.3. API Lambda
@@ -234,9 +272,108 @@ stream-insight-analyzer
 stream-insight-api
 ```
 
+Auroraへの接続が必要となるためVPC内へ配置する。
+
 ---
 
-## 7. Amazon SQS
+## 7. AWS Step Functions
+
+YouTube Live Chatの継続的な収集処理を管理するため、
+Step Functions Standard Workflowを利用する。
+
+想定State Machine名：
+
+```text
+stream-insight-dev-collection-workflow
+```
+
+### 7.1. 役割
+
+- Data Collector Lambdaの繰り返し実行
+- `nextPageToken`の保持
+- ポーリング間隔の制御
+- 配信終了判定
+- 一時的なエラーのRetry
+- コメント収集処理の終了制御
+
+---
+
+### 7.2. ワークフロー
+
+概念的なState Machine：
+
+```text
+Start
+  ↓
+Collect Comments
+(Data Collector Lambda)
+  ↓
+Live Chat終了？
+  ├── Yes
+  │     ↓
+  │    End
+  │
+  └── No
+        ↓
+       Wait
+        ↓
+Collect Comments
+        ↓
+       ...
+```
+
+Data Collector Lambdaから返却された以下の情報を
+State Machineの実行状態として保持する。
+
+```text
+streamId
+videoId
+liveChatId
+nextPageToken
+pollingInterval
+collectionStatus
+```
+
+これによりLambdaの実行時間上限を超える長時間配信についても、
+Lambdaを複数回呼び出すことで収集を継続できる。
+
+---
+
+### 7.3. Wait
+
+Data Collector Lambdaから取得したポーリング間隔を考慮して、
+次回のLambda実行までWaitする。
+
+短時間にYouTube Data APIを過剰に呼び出さないようにする。
+
+---
+
+### 7.4. Retry
+
+YouTube Data APIへのアクセスで一時的なエラーが発生した場合は、
+Step FunctionsのRetry機能を利用する。
+
+RetryではBackoffを設定する。
+
+一定回数のRetry後も処理できない場合は、
+State Machine Executionを失敗として終了させる。
+
+---
+
+### 7.5. 停止条件
+
+以下のいずれかを検知した場合、収集ワークフローを終了する。
+
+- YouTube Live配信終了
+- Live Chat終了
+- APIから継続取得不能であることを検知
+- Retry上限到達
+
+PoCではState Machine Executionを配信単位で作成する。
+
+---
+
+## 8. Amazon SQS
 
 Data Collector LambdaとAnalyzer Lambdaの間にSQSを配置する。
 
@@ -253,9 +390,11 @@ stream-insight-comment-queue
 - Lambda障害時のリトライ
 - Analyzer Lambdaへのイベント通知
 
+PoCでは複数コメントを1つのSQSメッセージとして送信する。
+
 ---
 
-### 7.1. Dead Letter Queue
+### 8.1. Dead Letter Queue
 
 処理に失敗したメッセージを保存するため、
 Dead Letter Queueを作成する。
@@ -268,7 +407,7 @@ stream-insight-comment-dlq
 
 ---
 
-## 8. Raw Data S3
+## 9. Raw Data S3
 
 コメント原データを保存するS3 Bucketを作成する。
 
@@ -291,7 +430,7 @@ raw/
 
 ---
 
-### 8.1. Lifecycle
+### 9.1. Lifecycle
 
 YouTube APIから取得したRaw Dataは、
 Stream Insightのデータ保持方針に従い、
@@ -314,7 +453,7 @@ Raw DataについてはGlacier等への長期アーカイブは行わない。
 
 ---
 
-### 8.2. Public Access
+### 9.2. Public Access
 
 Raw Data Bucketは非公開とする。
 
@@ -328,7 +467,7 @@ Block Public Access: ON
 
 ---
 
-## 9. Aurora Serverless v2
+## 10. Aurora Serverless v2
 
 分析結果およびアプリケーションデータを保存する。
 
@@ -350,9 +489,16 @@ PostgreSQL
 
 コメント原データは保存しない。
 
+`nextPageToken`等のLambda間の継続処理状態については、
+Step Functionsの実行状態で管理するため、
+Auroraへの保存を収集継続の必須条件とはしない。
+
+`collection_jobs`は収集結果・状態等のアプリケーションデータや
+運用上必要な履歴の保存に利用する。
+
 ---
 
-### 9.1. ネットワーク
+### 10.1. ネットワーク
 
 AuroraはPrivate Subnetへ配置する。
 
@@ -367,7 +513,7 @@ API LambdaおよびAnalyzer Lambdaからのアクセスのみ許可する。
 
 ---
 
-### 9.2. キャパシティ
+### 10.2. キャパシティ
 
 PoCでは可能な限り小さいキャパシティ設定から開始する。
 
@@ -376,7 +522,7 @@ PoCでは可能な限り小さいキャパシティ設定から開始する。
 
 ---
 
-## 10. API Gateway
+## 11. API Gateway
 
 REST APIをAPI Gatewayで公開する。
 
@@ -391,13 +537,13 @@ GET /streams/{streamId}/length-distribution
 GET /streams/{streamId}/frequent-words
 ```
 
-詳細は `api.md` に定義する。
+詳細は`api.md`に定義する。
 
 PoCでは外部ユーザー向けAPIとしての公開は行わない。
 
 ---
 
-## 11. Frontend
+## 12. Frontend
 
 Next.jsを静的サイトとして出力し、
 S3へ配置する。
@@ -414,7 +560,7 @@ CloudFront
 
 ---
 
-### 11.1. Frontend S3
+### 12.1. Frontend S3
 
 Frontend専用Bucketを作成する。
 
@@ -430,7 +576,7 @@ CloudFront経由のみでアクセスできる構成とする。
 
 ---
 
-### 11.2. CloudFront
+### 12.2. CloudFront
 
 CloudFrontからFrontend S3へアクセスする。
 
@@ -443,15 +589,17 @@ CloudFrontからFrontend S3へアクセスする。
 
 ---
 
-## 12. シークレット管理
+## 13. シークレット管理
 
 YouTube Data API KeyやOAuth 2.0認証情報等のシークレット情報は、
 ソースコードやGitHub Repositoryへ保存しない。
 
 情報の性質に応じて、
-AWS Systems Manager Parameter StoreとAWS Secrets Managerを使い分ける。
+AWS Systems Manager Parameter StoreとAWS Secrets Managerを利用する。
 
-### 12.1. YouTube Data API Key
+---
+
+### 13.1. YouTube Data API Key
 
 YouTube Data API KeyはParameter Storeで管理する。
 
@@ -465,12 +613,12 @@ Data Collector LambdaはIAM Role経由でParameter Storeへアクセスする。
 
 ---
 
-### 12.2. YouTube OAuth 2.0
+### 13.2. YouTube OAuth 2.0
 
 YouTube Live Chat取得にOAuth 2.0認可が必要となるため、
-Data Collector Lambdaから利用する認可情報を安全に管理する。
+Data Collector Lambdaから利用する認証情報を安全に管理する。
 
-PoCでは、初回認可は開発者または運用者が手動で実施する。
+PoCでは初回認可を開発者または運用者が手動で実施する。
 
 認可フロー：
 
@@ -481,11 +629,13 @@ YouTube OAuth 2.0 Authorization
         ↓
 Authorization Code
         ↓
-Access Token / Refresh Token
+Refresh Token
         ↓
 AWS Secrets Manager
         ↓
 Data Collector Lambda
+        ↓
+Access Token取得
         ↓
 YouTube Data API
 ```
@@ -508,18 +658,23 @@ stream-insight/dev/youtube/oauth
 Data Collector Lambdaには、
 対象Secretを取得するための最小限のIAM権限を付与する。
 
-Access TokenはRefresh Tokenを利用して必要に応じて更新する。
+Data Collector LambdaはRefresh Tokenを利用して
+必要に応じてAccess Tokenを取得する。
 
-Refresh Tokenの失効、認可取り消し等によってAccess Tokenを更新できない場合は、
+Access Tokenは原則としてLambda実行中のみ利用し、
+永続保存を必須としない。
+
+Refresh Tokenの失効や認可取り消し等によって
+Access Tokenを取得できない場合は、
 運用者が再度OAuth 2.0認可を実施する。
 
 PoCではOAuth 2.0認可画面および認可管理用Web UIは実装しない。
 
 ---
 
-## 13. IAM
+## 14. IAM
 
-各Lambdaには必要最小限の権限のみを付与する。
+各サービスには必要最小限の権限のみを付与する。
 
 ### Data Collector Lambda
 
@@ -547,25 +702,35 @@ Aurora Access
 CloudWatch Logs
 ```
 
+### Step Functions
+
+```text
+Lambda InvokeFunction
+CloudWatch Logs
+```
+
 最小権限の原則を適用する。
 
 ---
 
-## 14. ログ・監視
+## 15. ログ・監視
 
-LambdaのログはCloudWatch Logsへ出力する。
+LambdaおよびStep FunctionsのログはCloudWatchへ出力する。
 
 主な監視対象：
 
 - Lambda Error
 - Lambda Duration
 - Lambda Throttle
+- Step Functions Execution Failed
+- Step Functions Execution Timed Out
 - SQS Queue Depth
 - SQS DLQ Messages
 - API Gateway 4xx
 - API Gateway 5xx
 - Auroraエラー
-- YouTube OAuth 2.0 Token更新エラー
+- YouTube APIエラー
+- OAuth 2.0 Token取得エラー
 
 OAuth Client Secret、Refresh Token、Access Token等の認証情報はログへ出力しない。
 
@@ -573,7 +738,7 @@ PoCではCloudWatch Alarmの作り込みは最低限とする。
 
 ---
 
-## 15. AWS CDK
+## 16. AWS CDK
 
 AWSリソースはAWS CDKで管理する。
 
@@ -604,7 +769,7 @@ infrastructure/
 
 ---
 
-## 16. CDK Stack構成
+## 17. CDK Stack構成
 
 PoCでは以下のStack構成を基本とする。
 
@@ -633,6 +798,7 @@ PoCでは以下のStack構成を基本とする。
 - Data Collector Lambda
 - Analyzer Lambda
 - API Lambda
+- Step Functions State Machine
 - API Gateway
 - Parameter Store
 - Secrets Manager
@@ -646,7 +812,7 @@ PoCでは以下のStack構成を基本とする。
 
 ---
 
-## 17. 環境
+## 18. 環境
 
 PoCでは環境を増やしすぎない。
 
@@ -667,7 +833,7 @@ prod
 
 ---
 
-## 18. リソース命名規則
+## 19. リソース命名規則
 
 基本形式：
 
@@ -682,6 +848,7 @@ stream-insight-dev-raw
 stream-insight-dev-comment-queue
 stream-insight-dev-analyzer
 stream-insight-dev-api
+stream-insight-dev-collection-workflow
 ```
 
 グローバルに一意な名前が必要なリソースについては、
@@ -689,7 +856,7 @@ AWS Account ID等を付与する。
 
 ---
 
-## 19. タグ
+## 20. タグ
 
 AWSリソースには可能な限り以下のタグを付与する。
 
@@ -703,12 +870,13 @@ ManagedBy   = cdk
 
 ---
 
-## 20. コスト方針
+## 21. コスト方針
 
 PoCでは以下を重視する。
 
 - 常時稼働サーバーを使用しない
 - Lambdaを利用する
+- Step Functionsによって長時間処理を分割する
 - Raw DataはS3へ保存する
 - Raw Dataを7日で削除する
 - NAT Gatewayを可能な限り使用しない
@@ -718,12 +886,13 @@ PoCでは以下を重視する。
 
 ---
 
-## 21. 将来拡張
+## 22. 将来拡張
 
 PoC完了後、以下を検討する。
 
-- EventBridge
-- Step Functions
+- EventBridgeによるライブ配信自動検出
+- EventBridgeによる収集ワークフロー自動開始
+- Step Functionsワークフローの高度化
 - Amazon Bedrock
 - Amazon Athena
 - Amazon Cognito
