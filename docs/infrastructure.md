@@ -28,6 +28,7 @@ PoCでは以下のAWSサービスを利用する。
 | REST API           | Amazon API Gateway                     |
 | API処理            | AWS Lambda                             |
 | データ収集         | AWS Lambda                             |
+| 配信メタデータ保存 | AWS Lambda                             |
 | コメント収集制御   | AWS Step Functions                     |
 | コメント分析       | AWS Lambda                             |
 | 非同期処理         | Amazon SQS                             |
@@ -74,39 +75,53 @@ PoCでは以下のAWSサービスを利用する。
                       │ YouTube Data API│
                       └─────────────────┘
                               │
-                              │ Comments
+                              │ Stream Metadata
                               ▼
-                         ┌─────────┐
-                         │   SQS   │
-                         └────┬────┘
+                      ┌─────────────────┐
+                      │ Stream Metadata │
+                      │ Lambda          │
+                      └───────┬─────────┘
                               │
                               ▼
-                     ┌─────────────────┐
-                     │ Analyzer Lambda │
-                     └────────┬────────┘
-                              │
-                         ┌────┴─────┐
-                         ▼          ▼
-                  ┌──────────┐ ┌────────────────────┐
-                  │ S3 Raw   │ │ Aurora Serverless  │
-                  │ Data     │ │ PostgreSQL         │
-                  └──────────┘ └─────────▲──────────┘
-                                         │
-                                  ┌──────┴──────┐
-                                  │ API Lambda  │
-                                  └──────▲──────┘
-                                         │
-                                  ┌──────┴──────┐
-                                  │ API Gateway │
-                                  └──────▲──────┘
-                                         │
-                                      Next.js
+                      ┌────────────────────┐
+                      │ Aurora Serverless  │
+                      │ PostgreSQL         │
+                      └────────────────────┘
+
+Data Collector Lambda
+         │
+         │ Comments + streamId
+         ▼
+    ┌─────────┐
+    │   SQS   │
+    └────┬────┘
+         │
+         ▼
+┌─────────────────────┐
+│ Analyzer Lambda     │
+└──────────┬──────────┘
+           │
+      ┌────┴────┐
+      ▼         ▼
+┌──────────┐ ┌────────────────────┐
+│ S3 Raw   │ │ Aurora Serverless  │
+│ Data     │ │ PostgreSQL         │
+└──────────┘ └─────────▲──────────┘
+                       │
+                ┌──────┴──────┐
+                │ API Lambda  │
+                └──────▲──────┘
+                       │
+                ┌──────┴──────┐
+                │ API Gateway │
+                └──────▲──────┘
+                       │
+                    Next.js
 ```
 
-Step FunctionsはData Collector Lambdaを繰り返し呼び出し、
+Step Functionsは収集開始時に配信メタデータを永続化した後、
+Data Collector Lambdaを繰り返し呼び出し、
 配信終了までLive Chat取得を継続する。
-
-Data Collector Lambdaは単一実行で配信終了まで待機しない。
 
 ---
 
@@ -158,6 +173,7 @@ VPC外
    YouTube Data API
 
 VPC内
+├── Stream Metadata Lambda
 ├── Analyzer Lambda
 ├── API Lambda
 └── Aurora PostgreSQL
@@ -186,19 +202,6 @@ PoCではコスト削減のため、
 
 VPC内LambdaからAWSサービスへアクセスする場合は、
 必要に応じてVPC Endpointを利用する。
-
-例：
-
-```text
-VPC
-├── Private Subnet
-│   ├── Analyzer Lambda
-│   ├── API Lambda
-│   └── Aurora
-│
-├── S3 Gateway Endpoint
-└── 必要なInterface VPC Endpoint
-```
 
 必要となるVPC EndpointはCDK実装時に通信経路を確認したうえで決定する。
 
@@ -231,14 +234,45 @@ stream-insight-data-collector
 Data Collector LambdaはYouTube Data APIへアクセスするため、
 VPC外へ配置する。
 
+配信メタデータはStep Functions経由でStream Metadata Lambdaへ渡す。
+
 配信終了まで単一のLambdaを実行し続けず、
 1回の実行では一定範囲のコメント取得のみを行う。
 
 継続取得に必要な`nextPageToken`等はStep Functionsへ返却する。
 
+SQSへ送信するコメントデータには、
+Stream Metadata Lambdaによって採番された内部`streamId`を含める。
+
 ---
 
-### 6.2. Analyzer Lambda
+### 6.2. Stream Metadata Lambda
+
+役割：
+
+- 配信メタデータの受信
+- `channels`の作成・更新
+- `streams`の作成・更新
+- 内部`channelId`の採番・取得
+- 内部`streamId`の採番・取得
+- Step Functionsへの内部`streamId`返却
+
+想定Function名：
+
+```text
+stream-insight-stream-metadata
+```
+
+YouTube Channel IDおよびVideo IDは外部IDとして扱う。
+
+同一外部IDが既に登録されている場合は既存レコードを利用し、
+重複レコードを作成しない。
+
+Stream Metadata LambdaはAuroraへの接続が必要となるためVPC内へ配置する。
+
+---
+
+### 6.3. Analyzer Lambda
 
 役割：
 
@@ -254,11 +288,14 @@ VPC外へ配置する。
 stream-insight-analyzer
 ```
 
+SQSメッセージに含まれる内部`streamId`を利用して、
+対象配信の分析結果を保存する。
+
 Auroraへの接続が必要となるためVPC内へ配置する。
 
 ---
 
-### 6.3. API Lambda
+### 6.4. API Lambda
 
 役割：
 
@@ -289,6 +326,9 @@ stream-insight-dev-collection-workflow
 
 ### 7.1. 役割
 
+- 配信メタデータ取得
+- 配信メタデータ永続化
+- 内部`streamId`の保持
 - Data Collector Lambdaの繰り返し実行
 - `nextPageToken`の保持
 - ポーリング間隔の制御
@@ -304,6 +344,14 @@ stream-insight-dev-collection-workflow
 
 ```text
 Start
+  ↓
+Get Stream Metadata
+(Data Collector Lambda)
+  ↓
+Persist Stream Metadata
+(Stream Metadata Lambda)
+  ↓
+internal streamId
   ↓
 Collect Comments
 (Data Collector Lambda)
@@ -322,8 +370,8 @@ Collect Comments
        ...
 ```
 
-Data Collector Lambdaから返却された以下の情報を
-State Machineの実行状態として保持する。
+Data Collector LambdaおよびStream Metadata Lambdaから返却された
+以下の情報をState Machineの実行状態として保持する。
 
 ```text
 streamId
@@ -391,6 +439,9 @@ stream-insight-comment-queue
 - Analyzer Lambdaへのイベント通知
 
 PoCでは複数コメントを1つのSQSメッセージとして送信する。
+
+SQSメッセージには対象配信を識別するため、
+内部`streamId`を含める。
 
 ---
 
@@ -489,6 +540,9 @@ PostgreSQL
 
 コメント原データは保存しない。
 
+YouTube Channel IDおよびVideo IDを外部IDとして保持し、
+内部`channelId`および`streamId`はAurora側で採番する。
+
 `nextPageToken`等のLambda間の継続処理状態については、
 Step Functionsの実行状態で管理するため、
 Auroraへの保存を収集継続の必須条件とはしない。
@@ -509,7 +563,7 @@ Public Access: Disabled
 ```
 
 Security Groupによって、
-API LambdaおよびAnalyzer Lambdaからのアクセスのみ許可する。
+Stream Metadata Lambda、API LambdaおよびAnalyzer Lambdaからのアクセスのみ許可する。
 
 ---
 
@@ -597,8 +651,6 @@ YouTube Data API KeyやOAuth 2.0認証情報等のシークレット情報は、
 情報の性質に応じて、
 AWS Systems Manager Parameter StoreとAWS Secrets Managerを利用する。
 
----
-
 ### 13.1. YouTube Data API Key
 
 YouTube Data API KeyはParameter Storeで管理する。
@@ -610,8 +662,6 @@ YouTube Data API KeyはParameter Storeで管理する。
 ```
 
 Data Collector LambdaはIAM Role経由でParameter Storeへアクセスする。
-
----
 
 ### 13.2. YouTube OAuth 2.0
 
@@ -682,6 +732,13 @@ PoCではOAuth 2.0認可画面および認可管理用Web UIは実装しない�
 SQS SendMessage
 SSM GetParameter
 Secrets Manager GetSecretValue
+CloudWatch Logs
+```
+
+### Stream Metadata Lambda
+
+```text
+Aurora Access
 CloudWatch Logs
 ```
 
@@ -796,6 +853,7 @@ PoCでは以下のStack構成を基本とする。
 - SQS
 - DLQ
 - Data Collector Lambda
+- Stream Metadata Lambda
 - Analyzer Lambda
 - API Lambda
 - Step Functions State Machine
@@ -846,6 +904,7 @@ stream-insight-<environment>-<resource>
 ```text
 stream-insight-dev-raw
 stream-insight-dev-comment-queue
+stream-insight-dev-stream-metadata
 stream-insight-dev-analyzer
 stream-insight-dev-api
 stream-insight-dev-collection-workflow

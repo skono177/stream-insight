@@ -49,56 +49,70 @@ PoC後に以下へ拡張可能な構成とする。
                          └────────▲─┬───────┘
                                   │ │
                     Task Invoke   │ │ Comments
-                                  │ ▼
-                         ┌────────┴─────────┐
+                                  │ │
+                         ┌────────┴─▼───────┐
                          │ Step Functions   │
                          │ Collection       │
                          │ Workflow         │
+                         └───────┬──────────┘
+                                 │
+                                 │ Stream Metadata
+                                 ▼
+                         ┌──────────────────┐
+                         │     Lambda       │
+                         │ Stream Metadata  │
+                         └────────┬─────────┘
+                                  │
+                                  ▼
+                         ┌──────────────────┐
+                         │ Aurora Serverless│
+                         │   PostgreSQL     │
                          └──────────────────┘
-                                      │
-                                      │
-                                      ▼
-                              ┌──────────────┐
-                              │     SQS      │
-                              └──────┬───────┘
-                                     │
-                                     ▼
-                            ┌──────────────────┐
-                            │     Lambda       │
-                            │    Analyzer      │
-                            └───────┬──┬───────┘
-                                    │  │
-                       ┌────────────┘  └────────────┐
-                       ▼                            ▼
-              ┌──────────────────┐         ┌──────────────────┐
-              │       S3         │         │ Aurora Serverless│
-              │   Raw Comments   │         │   PostgreSQL     │
-              └──────────────────┘         │ Analysis Results │
-                                           └────────┬─────────┘
-                                                    ▲
-                                                    │
-                                           ┌────────┴─────────┐
-                                           │     Lambda       │
-                                           │    API Handler   │
-                                           └────────▲─────────┘
-                                                    │
-                                           ┌────────┴─────────┐
-                                           │   API Gateway    │
-                                           └────────▲─────────┘
-                                                    │
-                                           ┌────────┴─────────┐
-                                           │   Next.js / FE   │
-                                           └──────────────────┘
+
+Data Collector Lambda
+         │
+         │ Comments + streamId
+         ▼
+┌──────────────────┐
+│       SQS        │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│     Lambda       │
+│    Analyzer      │
+└───────┬──┬───────┘
+        │  │
+   ┌────┘  └────────────┐
+   ▼                     ▼
+┌──────────────────┐  ┌──────────────────┐
+│       S3         │  │ Aurora Serverless│
+│   Raw Comments   │  │   PostgreSQL     │
+└──────────────────┘  │ Analysis Results │
+                      └────────▲─────────┘
+                               │
+                      ┌────────┴─────────┐
+                      │     Lambda       │
+                      │    API Handler   │
+                      └────────▲─────────┘
+                               │
+                      ┌────────┴─────────┐
+                      │   API Gateway    │
+                      └────────▲─────────┘
+                               │
+                      ┌────────┴─────────┐
+                      │   Next.js / FE   │
+                      └──────────────────┘
 ```
 
 データ保存先を以下のように分離する。
 
 - **S3**：コメント等の取得した原データ
-- **Aurora PostgreSQL**：Web UIやAPIから利用する分析結果およびアプリケーションデータ
+- **Aurora PostgreSQL**：Web UIやAPIから利用する配信メタデータ、分析結果およびアプリケーションデータ
 
 大量のコメント原データをAuroraに保存せず、オブジェクトストレージであるS3に保存することで、データ量の増加に伴うデータベースコストを抑制する。
 
-一方、Web UIから頻繁に参照する分析結果はAuroraに保存し、APIから取得できるようにする。
+一方、Web UIから頻繁に参照する配信メタデータおよび分析結果はAuroraに保存し、APIから取得できるようにする。
 
 ---
 
@@ -128,6 +142,13 @@ Lambdaには1回あたりの実行時間上限があるため、
 Step FunctionsからData Collector Lambdaを繰り返し呼び出し、
 Live Chat取得を継続する。
 
+収集開始時にはData Collector Lambdaから取得した配信メタデータを
+Stream Metadata Lambdaへ渡し、Aurora PostgreSQLへ永続化する。
+
+Stream Metadata Lambdaから返却された内部`streamId`を
+Step Functionsの実行状態として保持し、
+以降のコメント収集処理へ引き継ぐ。
+
 Step Functionsの実行状態には主に以下の情報を保持する。
 
 ```text
@@ -147,9 +168,16 @@ collectionStatus
 ```text
 Start
   ↓
-Data Collector Lambda
+Get Stream Metadata
+(Data Collector Lambda)
   ↓
-コメント取得
+Persist Stream Metadata
+(Stream Metadata Lambda)
+  ↓
+internal streamId取得
+  ↓
+Collect Comments
+(Data Collector Lambda)
   ↓
 SQSへ送信
   ↓
@@ -162,7 +190,7 @@ nextPageToken取得
       ↓
      Wait
       ↓
-Data Collector Lambda
+Collect Comments
       ↓
      ...
 ```
@@ -193,20 +221,79 @@ YouTube Data APIから対象配信のデータを取得する。
 - コメントデータのSQSへの送信
 - Step Functionsへの取得結果返却
 
+収集開始時には、以下の配信メタデータをStep Functionsへ返却する。
+
+```text
+videoId
+channelId
+channelTitle
+title
+startedAt
+liveChatId
+```
+
+Data Collector Lambda自身では配信メタデータをAuroraへ保存しない。
+
+配信メタデータの永続化はStream Metadata Lambdaの責務とする。
+
 Data Collector Lambda自身では配信終了まで待機しない。
 
 1回のLambda実行では一定範囲のLive Chatを取得して処理を終了し、
 取得継続に必要な`nextPageToken`等をStep Functionsへ返却する。
 
-これによりLambdaの実行時間上限を超える長時間配信についても、
-複数回のLambda実行によってコメント取得を継続する。
+コメントをSQSへ送信する際には、
+Stream Metadata Lambdaによって採番された内部`streamId`を含める。
+
+これによりAnalyzer Lambdaは外部Video IDから内部`streamId`を解決する必要がない。
 
 Data Collector LambdaはYouTube Data APIへアクセスする必要があるため、
 Auroraへ直接接続せず、VPC外で実行する構成を基本とする。
 
 ---
 
-### 4.4. Amazon SQS
+### 4.4. Stream Metadata Lambda
+
+Data Collector Lambdaが取得した配信メタデータを
+Aurora PostgreSQLへ永続化する。
+
+主な責務：
+
+- YouTube Channel IDを外部IDとして`channels`を作成または更新
+- YouTube Video IDを外部IDとして`streams`を作成または更新
+- 内部`channelId`の採番・取得
+- 内部`streamId`の採番・取得
+- 内部`streamId`をStep Functionsへ返却
+
+配信メタデータの永続化はコメント収集開始前に実行する。
+
+同じYouTube Channel IDまたはVideo IDが既に登録されている場合は、
+既存レコードを利用し、重複レコードを作成しない。
+
+概念的な処理：
+
+```text
+Stream Metadata
+      ↓
+YouTube Channel ID
+      ↓
+channels Upsert
+      ↓
+internal channelId
+      ↓
+YouTube Video ID
+      ↓
+streams Upsert
+      ↓
+internal streamId
+      ↓
+Step Functions
+```
+
+Stream Metadata LambdaはAuroraへアクセスするためVPC内へ配置する。
+
+---
+
+### 4.5. Amazon SQS
 
 データ収集処理と分析処理の間に配置する。
 
@@ -219,9 +306,19 @@ Auroraへ直接接続せず、VPC外で実行する構成を基本とする。
 
 PoCでは、複数のコメントを1メッセージにまとめて送信する方式を基本とする。
 
+SQSへ送信するコメントデータには内部`streamId`を含める。
+
+概念的なメッセージ：
+
+```text
+streamId
+videoId
+comments
+```
+
 ---
 
-### 4.5. Analyzer Lambda
+### 4.6. Analyzer Lambda
 
 SQSからコメントデータを取得し、
 原データの保存および分析処理を行う。
@@ -232,6 +329,9 @@ SQSからコメントデータを取得し、
 - コメント原データをS3へ保存
 - コメントデータの集計・分析
 - 分析結果をAurora PostgreSQLへ保存
+
+Analyzer LambdaはSQSメッセージに含まれる内部`streamId`を利用して、
+対象配信の分析結果を保存する。
 
 主な分析：
 
@@ -244,7 +344,7 @@ SQSからコメントデータを取得し、
 
 ---
 
-### 4.6. Amazon S3
+### 4.7. Amazon S3
 
 YouTube Liveから取得したコメント等の原データを保存する。
 
@@ -261,7 +361,7 @@ Web UIから頻繁に参照する分析結果は保存しない。
 
 ---
 
-### 4.7. Aurora Serverless v2 PostgreSQL
+### 4.8. Aurora Serverless v2 PostgreSQL
 
 Web UIやAPIから利用する分析結果およびアプリケーションデータを保存する。
 
@@ -279,11 +379,15 @@ Web UIやAPIから利用する分析結果およびアプリケーションデ�
 PoCではリレーショナルデータベースを採用し、
 SQLによる集計・検索・比較を容易にする。
 
+YouTube Channel IDおよびVideo IDは外部IDとして保持し、
+アプリケーション内部ではAurora側で採番した
+`channelId`および`streamId`を利用する。
+
 保存対象の詳細は`data-model.md`で定義する。
 
 ---
 
-### 4.8. Amazon API Gateway
+### 4.9. Amazon API Gateway
 
 Web UIから利用するREST APIのエンドポイントを提供する。
 
@@ -293,7 +397,7 @@ PoCでは外部ユーザー向けAPI公開は対象外とする。
 
 ---
 
-### 4.9. API Lambda
+### 4.10. API Lambda
 
 API Gatewayからのリクエストを受け付け、
 Aurora PostgreSQLから分析結果を取得してレスポンスを返す。
@@ -307,7 +411,7 @@ Aurora PostgreSQLから分析結果を取得してレスポンスを返す。
 
 ---
 
-### 4.10. Next.js
+### 4.11. Next.js
 
 分析結果をWeb UIとして表示する。
 
@@ -338,7 +442,20 @@ Step Functions
 Data Collector Lambda
      ↓
 YouTube Data API
+     ↓
+Stream Metadata
+     ↓
+Stream Metadata Lambda
+     ↓
+Aurora PostgreSQL
+     ↓
+internal streamId
+     ↓
+Step Functions
 ```
+
+コメント収集を開始する前に、
+`channels`および`streams`をAurora PostgreSQLへ永続化する。
 
 ---
 
@@ -367,7 +484,7 @@ Data Collector Lambda
 
 Data Collector Lambdaは1回の実行で一定範囲のコメントを取得する。
 
-取得したコメントはSQSへ送信する。
+取得したコメントには内部`streamId`を付与してSQSへ送信する。
 
 次回取得位置を示す`nextPageToken`はStep Functionsの実行状態として保持し、
 次回のLambda呼び出しへ引き継ぐ。
@@ -393,7 +510,7 @@ Analyzer LambdaがSQSからコメントデータを取得し、以下の処理�
 
 1. コメント原データをS3へ保存する
 2. コメントデータを分析する
-3. 分析結果をAurora PostgreSQLへ保存する
+3. SQSメッセージの内部`streamId`を利用して分析結果をAurora PostgreSQLへ保存する
 
 コメント原データと分析結果を保存先ごとに分離することで、
 大量のコメントデータを低コストで保持しながら、
@@ -419,7 +536,7 @@ API Gateway
 Next.js
 ```
 
-Web UIから参照する分析結果はAurora PostgreSQLから取得する。
+Web UIから参照する配信情報および分析結果はAurora PostgreSQLから取得する。
 
 PoCでは、Web UIからS3上のコメント原データを直接参照する機能は提供しない。
 
@@ -435,6 +552,10 @@ PoCでは、特定のYouTube Live配信を対象として、
 
 Data Collector Lambdaは短時間の処理単位として実行し、
 配信終了まで単一Lambdaを実行し続けない。
+
+コメント収集開始前にStream Metadata Lambdaによって
+配信メタデータをAurora PostgreSQLへ永続化し、
+内部`streamId`を確定させる。
 
 ### 6.1. 継続条件
 
