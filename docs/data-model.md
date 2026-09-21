@@ -151,10 +151,15 @@ YouTube Liveの配信を表す。
 - Channel ID
 - 配信タイトル
 - 配信開始日時
-- 配信終了日時
+- 配信終了日時（`endedAt`、NULL許容）
 - 配信URL
 - 作成日時
 - 更新日時
+
+`streams.endedAt`はYouTubeの`liveStreamingDetails.actualEndTime`をUTCで保存する。
+配信中または実終了日時が未取得の場合はNULLとし、収集停止時刻・現在時刻・予定終了時刻で補完しない。
+終了時にData Collectorが再取得し、Stream Metadata Lambdaが更新する。
+取得できなかった項目で既存値をNULLへ上書きせず、開始処理の再実行でも確定済み終了日時を保持する。
 
 ---
 
@@ -268,6 +273,28 @@ YouTubeからのデータ収集処理を管理するための情報を表す。
 - エラー情報
 
 収集処理の再実行や障害発生時の調査に利用する。
+
+具体的な終了管理項目は以下とする。
+
+| 項目                  | 意味                                                                              |
+| --------------------- | --------------------------------------------------------------------------------- |
+| `executionArn`        | 収集ワークフローのExecution ARN。一意制約を設定し、再試行時も同じジョブを更新する |
+| `collectionStatus`    | RUNNING / COMPLETED / FAILED                                                      |
+| `collectionStoppedAt` | コメント収集を停止した時刻。終了処理への遷移時に一度だけ確定する                  |
+| `stopReason`          | 配信・Live Chat終了、API継続不能、Retry上限等の停止理由                           |
+| `errorCode`           | 最終メタデータ未取得等を含むエラー種別。レスポンス本文や認証情報は保存しない      |
+
+開始時にRUNNINGで登録する。
+終了時は`streams`の最終メタデータ更新と同一トランザクションで終了状態を保存する。
+収集失敗がなく実終了日時の保存まで成功した場合だけCOMPLETEDとし、
+収集失敗・最終メタデータ未取得時はFAILEDとする。
+COMPLETEDはSQSの消化やAnalyzerの分析完了を保証しない。
+
+配信自体の終了日時`streams.endedAt`と`collectionStoppedAt`は別の値として扱う。
+同じ終了要求の再実行で収集停止時刻を変更せず、終端状態をRUNNINGへ戻さない。
+終了処理だけを復旧する場合も元の`executionArn`を指定し、収集失敗履歴を保持する。
+DB保存に失敗した場合は状態がRUNNINGのまま残る可能性があるため、
+Step Functionsの失敗通知から`architecture.md`の6.5節に従って補完する。
 
 ---
 

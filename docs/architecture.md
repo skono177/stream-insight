@@ -184,7 +184,13 @@ SQSへ送信
 nextPageToken取得
   ↓
 配信終了？
-  ├─ Yes → End
+  ├─ Yes
+  │   ↓
+  │  Get Final Stream Metadata (Data Collector Lambda)
+  │   ↓
+  │  Persist Final Metadata / Collection Status (Stream Metadata Lambda)
+  │   ↓
+  │  保存成功後にEnd（失敗時はRetry / Catch）
   │
   └─ No
       ↓
@@ -199,10 +205,11 @@ Wait時間はYouTube Data APIから取得できるポーリング間隔を考慮
 
 一時的なエラーについてはStep FunctionsのRetry機能を利用する。
 
-配信またはLive Chatの終了を検知した場合はワークフローを終了する。
+配信またはLive Chatの終了検知時は6.5節の終了処理へ進み、
+最終メタデータと収集状態の保存成功後にワークフローを正常終了する。
 
-一定回数のリトライ後も処理できない場合はワークフローを異常終了させ、
-CloudWatch Logs等から確認できるようにする。
+収集TaskのRetry上限到達等はCatchから終了処理へ進み、
+収集失敗を記録してから異常終了する。保存自体の失敗も通知対象とする。
 
 ---
 
@@ -213,6 +220,7 @@ YouTube Data APIから対象配信のデータを取得する。
 主な責務：
 
 - OAuth 2.0 Access Tokenの取得
+- 終了時の最終メタデータ再取得（`videos.list`の`snippet,liveStreamingDetails`）
 - 配信情報取得
 - Live Chat ID取得
 - コメント取得
@@ -278,8 +286,16 @@ Aurora PostgreSQLへ永続化する。
 - 内部`channelId`の採番・取得
 - 内部`streamId`の採番・取得
 - 内部`streamId`をStep Functionsへ返却
+- `collection_jobs`の開始登録および終了状態更新
+- 終了時の`streams.endedAt`を含む最終メタデータ更新
 
-配信メタデータの永続化はコメント収集開始前に実行する。
+配信メタデータの永続化はコメント収集開始前および収集終了時に実行する。
+開始時にStep Functions Execution ARNを一意キーとして`collection_jobs`を登録し、
+終了時は同じ実行のレコードを更新する。
+
+終了時の`streams`更新と`collection_jobs`更新は同一Auroraトランザクションで確定する。
+同じ終了要求を再実行しても重複レコードを作成せず、確定済みの終了情報を消さない。
+Stream Metadata LambdaはYouTube APIを直接呼び出さず、Data Collectorから渡された必要項目だけを保存する。
 
 同じYouTube Channel IDまたはVideo IDが既に登録されている場合は、
 既存レコードを利用し、重複レコードを作成しない。
@@ -662,6 +678,53 @@ SQS送信後・Task結果返却前の失敗でも、同じ送信内容から同�
 PoCでは対象外とする。
 
 PoC完了後、EventBridge等を利用した自動化を検討する。
+
+---
+
+### 6.5. 終了情報の永続化
+
+配信またはLive Chatの終了検知時は、そのままEndへ遷移せず、以下を実行する。
+
+1. 取得済みコメントの全分割バッチのSQS送信成功を確認する。送信失敗時は正常終了扱いにしない
+2. Step Functionsで`collectionStoppedAt`を一度だけ確定し、Execution ARN、内部`streamId`、`videoId`、停止理由とともに保持する
+3. Data Collectorを最終メタデータ取得モードで呼び出し、`videos.list(part=snippet,liveStreamingDetails, id=videoId)`からタイトル、実開始日時、実終了日時を再取得する。このモードではコメントを再送信しない
+4. Stream Metadata Lambdaへ必要項目を渡し、`streams`の最終メタデータと対象`collection_jobs`の終了状態を同一トランザクションで保存する
+5. 保存成功応答後にのみ正常終了する
+
+`streams.endedAt`には`liveStreamingDetails.actualEndTime`をUTCで保存する。
+収集停止時刻、現在時刻、予定終了時刻を代用しない。
+Live Chatの終了・無効化だけで配信自体が終了したとは判定しない。
+
+最終メタデータが未取得、または`actualEndTime`が未反映の場合は、
+Step FunctionsのWaitで30秒間隔、初回を含め最大5回まで再取得する。
+この回数はAPIエラー時の試行も含む上限とし、Lambda内で待機しない。
+認証失効・アクセス拒否等の継続不能エラーは再試行を打ち切る。
+
+上限到達・継続不能時は取得できた項目だけを保存し、
+未取得の`endedAt`はNULLのまま（既存値がある場合は保持）とする。
+`collection_jobs.collectionStatus=FAILED`、停止理由・エラー種別を保存し、Failへ遷移する。
+配信継続中にLive Chatだけが閉じた場合も、終了日時を捏造せずこの経路で扱う。
+
+収集中のエラーで停止した場合もCatchから同じ終了処理へ進める。
+実終了日時を取得できても、収集失敗があった実行をCOMPLETEDに変更しない。
+収集失敗がなく、実終了日時と終了状態を保存できた場合のみCOMPLETEDとする。
+COMPLETEDは収集ワークフローの完了を表し、SQSの消化・分析完了を意味しない。
+
+DB保存は初回を含め最大4回、2秒・4秒・8秒のBackoffで再試行する。
+保存失敗またはCommit後の応答喪失では、保持済みの同じ終了要求を再送する。
+再試行で`collectionStoppedAt`を現在時刻へ置き換えない。
+DB保存のRetry上限到達時はFailとし、実行ID・エラー種別を記録して通知する。
+DB障害時に収集状態まで保存できたとは扱わない。
+
+運用者は失敗したExecution ARNと`videoId`を指定し、
+コメント収集を行わない終了処理専用の実行からメタデータ再取得・保存を再実行する。
+更新対象は元のCollection Jobとし、復旧実行のARNで別の収集ジョブを作らない。
+収集失敗履歴は保持し、欠けていた実終了日時だけを補完できるようにする。
+手動停止・State Machine全体のタイムアウト等でCatchを実行できなかった場合も、この手順で補完する。
+
+実装時は、正常終了、実終了日時の反映遅延、Live Chatのみ終了、
+API取得失敗、DB Commit前の失敗・Commit後の応答喪失を検証する。
+終了保存後に`GET /streams`と`GET /streams/{streamId}`が同じ実終了日時を返すことも確認する。
 
 ---
 

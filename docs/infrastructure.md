@@ -331,6 +331,8 @@ Stream Metadata Lambdaによって採番された内部`streamId`と
 - 配信メタデータの受信
 - `channels`の作成・更新
 - `streams`の作成・更新
+- 終了時の最終メタデータ（`endedAt`を含む）更新
+- Execution ARNを一意キーとする`collection_jobs`の開始登録・終了状態更新
 - 内部`channelId`の採番・取得
 - 内部`streamId`の採番・取得
 - Step Functionsへの内部`streamId`返却
@@ -448,6 +450,7 @@ stream-insight-dev-collection-workflow
 - 配信終了判定
 - 一時的なエラーのRetry
 - コメント収集処理の終了制御
+- 終了時のメタデータ再取得と、配信情報・収集状態の永続化
 
 ---
 
@@ -472,7 +475,11 @@ Collect Comments
 Live Chat終了？
   ├── Yes
   │     ↓
-  │    End
+  │    Get Final Stream Metadata (Data Collector Lambda)
+  │     ↓
+  │    Persist Final Metadata / Collection Status (Stream Metadata Lambda)
+  │     ↓
+  │    保存成功後にEnd（失敗時はRetry / Catch）
   │
   └── No
         ↓
@@ -516,14 +523,18 @@ Step FunctionsのRetry機能を利用する。
 
 RetryではBackoffを設定する。
 
-一定回数のRetry後も処理できない場合は、
-State Machine Executionを失敗として終了させる。
+収集TaskのRetry上限到達時はCatchで終了処理へ進み、
+収集失敗状態を保存してからState Machine Executionを失敗として終了させる。
+
+終了時の最終メタデータ取得は初回を含め最大5回、30秒間隔のWaitで再試行する。
+DB保存は初回を含め最大4回、2秒・4秒・8秒のBackoffで再試行する。
+終了時の再試行・復旧手順は`architecture.md`の6.5節に従う。
 
 ---
 
 ### 7.5. 停止条件
 
-以下のいずれかを検知した場合、収集ワークフローを終了する。
+以下のいずれかを検知した場合、コメント収集を停止して終了情報の永続化へ進む。
 
 - YouTube Live配信終了
 - Live Chat終了
@@ -531,6 +542,14 @@ State Machine Executionを失敗として終了させる。
 - Retry上限到達
 
 PoCではState Machine Executionを配信単位で作成する。
+
+最終メタデータはVPC外のData Collectorが取得し、
+VPC内のStream Metadata Lambdaが`streams`と`collection_jobs`を同一トランザクションで更新する。
+Execution ARNと収集停止時刻を実行状態で保持し、再試行でも同じ終了要求を使用する。
+
+実終了日時を取得・保存できない場合や収集失敗時は正常終了にせず、
+可能な範囲で失敗状態を保存してFailへ遷移する。
+DB保存自体に失敗した場合はCloudWatch Alarmで通知し、終了処理専用の実行で補完する。
 
 ---
 
@@ -1133,6 +1152,8 @@ API Gateway 5xx
 API Gateway 429
 API Lambda Throttle
 SQS DLQ Messages
+Step Functions Execution Failed
+Step Functions Execution Timed Out
 ```
 
 ---
