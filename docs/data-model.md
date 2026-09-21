@@ -102,6 +102,12 @@ PoCでは`batchId`を利用して以下のような構成とする。
 
 ```text
 s3://<bucket>/
+├── outbox/
+│   └── youtube/
+│       └── collection-jobs/
+│           └── <collection-job-id>/
+│               └── batches/
+│                   └── <batch-id>.json
 └── raw/
     └── youtube/
         └── streams/
@@ -112,9 +118,17 @@ s3://<bucket>/
                     └── ...
 ```
 
+`outbox/`には、SQS送信前に7章のメッセージと同一のJSON Payloadを一時保存する。
+Data CollectorはOutboxオブジェクトの保存後に送信予定をAuroraへ登録し、
+登録が完了したオブジェクトだけをSQSへ送信する。
+
 S3オブジェクトキーを`batchId`から決定することで、
 同じSQSメッセージが再処理された場合でも同一オブジェクトへ保存し、
 重複したRaw Dataオブジェクトの生成を防止する。
+
+Outboxオブジェクトは条件付き書き込み（`If-None-Match: *`）で新規作成する。
+同じキーが既に存在する場合は既存オブジェクトのPayload SHA-256との一致を確認して再利用し、
+異なる内容で既存オブジェクトを上書きしない。
 
 実際のバケット名・パス構成はインフラ実装時に決定する。
 
@@ -400,19 +414,27 @@ Step Functionsの失敗通知から`architecture.md`の6.5節に従って補完�
 
 ### 4.8. Collection Job Batch
 
-収集ジョブがSQSへの送信に成功し、Analyzerによる完了確認が必要なコメントバッチを表す。
+収集ジョブがSQSへ送信する前に永続化した、Analyzerによる完了確認が必要なコメントバッチを表す。
 
 主な情報：
 
 - Collection Job ID
 - Batch ID
-- 登録日時
+- Outboxオブジェクトキー
+- Payload SHA-256
+- 登録日時（`registeredAt`）
 
 `(collectionJobId, batchId)`を複合主キーとする。
 
-Data CollectorがSQSから送信成功応答を受け取った後、
-Step FunctionsはStream Metadata Lambdaを呼び出し、返却された`batchId`を冪等に登録する。
-同じページの再試行で同じ`batchId`が返された場合も重複行を作成しない。
+Data Collectorが全分割バッチをS3 Outboxへ保存した後、
+Step FunctionsはStream Metadata Lambdaを呼び出し、SQS送信前に全バッチを一つのトランザクションで登録する。
+同じ登録要求の再実行では重複行を作成せず、既存行を返す。
+同じ主キーに異なるOutboxオブジェクトキーまたはPayload SHA-256が指定された場合は、
+既存行を上書きせず登録要求を失敗させる。
+
+Data Collectorの送信モードは、登録成功後にS3 OutboxからPayloadを読み出し、
+SHA-256が登録値と一致することを確認してSQSへ送信する。
+SQS送信後にTask結果を返せなかった場合も、YouTube APIを再取得せず同じPayloadを再送信する。
 
 分析完了の判定では、対象収集ジョブの`collection_job_batches`すべてについて、
 同じ`batchId`が`processed_comment_batches`へ登録済みであることを確認する。
@@ -507,6 +529,10 @@ Data Collector Lambda
  ↓
 必要項目のみ抽出
  ↓
+S3 Outbox
+ ↓
+collection_job_batchesへ送信前登録
+ ↓
 SQS
  ↓
 Analyzer Lambda
@@ -557,6 +583,9 @@ PoCでは、複数のコメントを1メッセージにまとめる方式を基�
 各メッセージには収集ジョブを識別する`collectionJobId`と、
 コメントバッチを一意に識別する`batchId`を含める。
 
+SQSへ送信するJSON Payloadは、送信前にS3 Outboxへ同じUTF-8バイト列で保存する。
+Payload SHA-256はこのバイト列から算出し、`collection_job_batches`へ登録する。
+
 例：
 
 ```json
@@ -589,9 +618,10 @@ PoCで利用しないデータはSQSメッセージへ含めない。
 `batchId`はData Collector Lambdaで7.1節の規則により決定的に生成し、
 Analyzer Lambdaでは別のIDへ置き換えない。
 
-SQS再配信に加え、Data Collectorの再実行でも同じ送信内容には同じIDを使用する。
-SQSの送信成功を全分割バッチで確認してから次ページトークンを返却する。
-一部の送信失敗・結果不明時は取得位置を進めず再試行する。
+SQS再配信に加え、送信結果不明時の再送信でも同じ送信内容には同じIDを使用する。
+全分割バッチをS3 Outboxへ保存し、`collection_job_batches`への登録をCommitしてからSQSへ送信する。
+SQSの送信成功を全登録済みバッチで確認してから次ページトークンを採用する。
+一部の送信失敗・結果不明時は取得位置を進めず、登録済みOutbox Payloadの送信を再試行する。
 
 ### 7.1. batchId生成仕様
 
@@ -652,7 +682,7 @@ channels
 `processed_comment_batches`はRaw Dataそのものではなく、
 SQSメッセージの冪等処理を実現するための処理管理情報として保存する。
 
-`collection_job_batches`は送信成功済みバッチと分析完了済みバッチを突合し、
+`collection_job_batches`はSQS送信前に登録済みのバッチと分析完了済みバッチを突合し、
 終了後の分析確定を開始できるか判定するための処理管理情報として保存する。
 
 ---
@@ -726,6 +756,12 @@ Data Collectorの再実行とStandard SQSの重複配信の両方を対象とす
 - 同じ送信内容：7.1節により同じ`batchId`を生成する
 - 異なるバッチに含まれる同じコメント：`(streamId, commentId)`で重複を排除する
 
+送信バッチは、S3 OutboxへのPayload保存、`collection_job_batches`への登録、
+登録済みPayloadのSQS送信の順に処理する。
+Auroraへの登録がCommitされる前にSQSへ送信しない。
+登録後の送信失敗または結果不明時は同じOutbox Payloadを再送信するため、
+実際にSQSへ送信されたバッチが分析完了判定の追跡対象から漏れない。
+
 AnalyzerはS3保存成功後、以下を一つのAuroraトランザクションで実行する。
 
 1. `processed_comment_batches`へ`INSERT ... ON CONFLICT DO NOTHING RETURNING`で登録し、登録できなければ集計せず終了する
@@ -746,7 +782,7 @@ Raw Dataから再分析する場合も`(streamId, commentId)`で重複を除く�
 同じコメントIDの内容が変わった場合の訂正集計はPoC対象外とし、
 通常の集計は最初に処理済み登録できた内容を採用する。
 
-実装時には、SQS送信後・Task結果返却前の失敗、分割送信の一部失敗、
+実装時には、Outbox保存前後、Aurora登録のCommit前後、SQS送信後・Task結果返却前の失敗、分割送信の一部失敗、
 コメント集合の部分的な重複、同一バッチ・重複コメントの並行処理、
 Aurora Commit前後の失敗で集計値が二重加算されないことを検証する。
 
@@ -1007,6 +1043,9 @@ frequent_words
 YouTube APIから取得した未承認データについては、
 YouTube API Services Developer Policiesの保存期間に関する要件を考慮し、
 Stream Insightでは7暦日を超えて保存しない。
+
+S3 OutboxのPayloadもコメント本文を含むためRaw Dataと同じ保持対象とし、
+`outbox/`プレフィックスへ7暦日で削除するLifecycle Ruleを適用する。
 
 S3 Lifecycleを利用し、
 保存開始から7暦日を経過したRaw Dataを自動削除する。

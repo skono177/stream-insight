@@ -71,7 +71,13 @@ PoC後に以下へ拡張可能な構成とする。
 
 Data Collector Lambda
          │
-         │ Comments + streamId + batchId
+         │ 1. Outbox Payload保存
+         ▼
+┌──────────────────┐
+│ S3 Outbox        │
+└────────┬─────────┘
+         │
+         │ 2. Auroraへ送信予定登録後、同じPayloadを送信
          ▼
 ┌──────────────────┐
 │       SQS        │
@@ -181,7 +187,13 @@ internal streamId取得
 Collect Comments
 (Data Collector Lambda)
   ↓
+S3 OutboxへPayload保存
+  ↓
+Register Outbox Batch
+(Stream Metadata Lambda)
+  ↓
 SQSへ送信
+(Data Collector Lambda)
   ↓
 nextPageToken取得
   ↓
@@ -233,7 +245,8 @@ YouTube Data APIから対象配信のデータを取得する。
 - `nextPageToken`の取得
 - ポーリング間隔の取得
 - コメントバッチ単位の`batchId`生成
-- コメントデータのSQSへの送信
+- コメントバッチのS3 Outboxへの保存
+- Auroraへの登録が完了したOutbox PayloadのSQSへの送信
 - Step Functionsへの取得結果返却
 
 収集開始時には、以下の配信メタデータをStep Functionsへ返却する。
@@ -256,22 +269,31 @@ Data Collector Lambda自身では配信終了まで待機しない。
 1回のLambda実行では一定範囲のLive Chatを取得して処理を終了し、
 取得継続に必要な`nextPageToken`等をStep Functionsへ返却する。
 
-コメントをSQSへ送信する際には、
-Stream Metadata Lambdaによって採番された内部`streamId`と、
-収集ジョブを識別する`collectionJobId`、
-コメントバッチを一意に識別する`batchId`を含める。
+取得したコメントは、SQSへ直接送信する前に、
+内部`streamId`、`collectionJobId`および`batchId`を含む送信Payloadとして
+S3 Outboxへ保存する。
 
 `batchId`はランダムUUID、Lambda Request ID、実行時刻、Retry回数から生成せず、
 送信対象の内容から決定的に生成する。生成仕様は`data-model.md`の7.1節に定義する。
 同じ内容のコメントバッチは、Lambdaの再実行やSQS再配信をまたいで同じIDとなる。
 
-SQS送信が成功していても、その後のLambda失敗により同じページが再取得されることがある。
-再取得でコメントの集合や分割境界が変わる可能性も考慮し、
-Analyzerでは`batchId`に加えて`(streamId, commentId)`単位でも重複を排除する。
+Data CollectorはS3への保存後、`batchId`、OutboxオブジェクトキーおよびPayload SHA-256を
+Step Functionsへ返す。Step FunctionsはStream Metadata Lambdaを呼び出し、
+全分割バッチを`collection_job_batches`へ登録する。
 
-すべての分割バッチのSQS送信成功を確認した後にのみ、
-送信成功した`batchId`の一覧と`nextPageToken`をStep Functionsへ返却する。
-一部の送信失敗・結果不明時はTaskを失敗させ、取得位置を進めず再試行する。
+登録完了後、Data Collectorを送信モードで呼び出す。
+送信モードではYouTube APIを再取得せず、登録済みのS3 Outbox Payloadを読み出し、
+SHA-256が登録値と一致することを確認してSQSへ送信する。
+これにより、SQSへ実際に送信されるすべてのバッチは送信前に追跡対象となる。
+
+SQS送信後・Task結果返却前に失敗した場合は、同じOutbox Payloadを再送信する。
+再取得による内容や分割境界の変化は送信再試行へ影響しない。
+SQSの重複配信および送信結果不明時の再送信は`batchId`で排除し、
+別の取得結果に同じコメントが含まれる場合は`(streamId, commentId)`で排除する。
+
+全登録済みバッチのSQS送信成功を確認した後にのみ、
+Step Functionsは`nextPageToken`を次の取得位置として採用する。
+一部の送信失敗・結果不明時は取得位置を進めず、同じOutbox Payloadの送信を再試行する。
 空のバッチは送信しないが、取得が正常終了した場合の次ページトークンは返却する。
 
 これによりAnalyzer Lambdaは外部Video IDから内部`streamId`を解決する必要がない。
@@ -293,13 +315,17 @@ Aurora PostgreSQLへ永続化する。
 - 内部`channelId`の採番・取得
 - 内部`streamId`の採番・取得
 - 内部`streamId`および`collectionJobId`をStep Functionsへ返却
-- SQS送信成功済み`batchId`の`collection_job_batches`への冪等登録
+- SQS送信前の`batchId`、OutboxオブジェクトキーおよびPayload SHA-256の`collection_job_batches`への冪等登録
 - `collection_jobs`の開始登録および終了状態更新
 - 終了時の`streams.endedAt`を含む最終メタデータ更新
 
 配信メタデータの永続化はコメント収集開始前および収集終了時に実行する。
 開始時にStep Functions Execution ARNを一意キーとして`collection_jobs`を登録し、
 終了時は同じ実行のレコードを更新する。
+
+コメントバッチの登録はSQS送信前に行い、同じ登録要求の再実行では既存行を返す。
+同じ`collectionJobId`と`batchId`に異なるオブジェクトキーまたはPayload SHA-256が指定された場合は、
+既存行を上書きせずエラーとする。
 
 終了時の`streams`更新と`collection_jobs`更新は同一Auroraトランザクションで確定する。
 同じ終了要求を再実行しても重複レコードを作成せず、確定済みの終了情報を消さない。
@@ -423,6 +449,7 @@ YouTube Liveから取得したコメント等の原データを保存する。
 主な用途：
 
 - コメント原データの保存
+- SQS送信前のコメントバッチPayloadの一時的なOutbox保存
 - 保持期間内における再分析
 - 大量データの低コストな保存
 
@@ -431,6 +458,9 @@ Web UIから頻繁に参照する分析結果は保存しない。
 
 Raw Dataのオブジェクトキーには`batchId`を利用し、
 同一バッチを再処理した場合でも同一オブジェクトへ保存する。
+
+Outbox Payloadも`batchId`から決まるキーへ保存する。
+Data CollectorはAuroraへ登録済みのOutbox PayloadだけをSQSへ送信する。
 
 保存形式、オブジェクト構成および保持期間の詳細は`data-model.md`で定義する。
 
@@ -490,7 +520,7 @@ Aurora PostgreSQLから分析結果を取得してレスポンスを返す。
 
 ### 4.11. Analysis Finalizer Lambda
 
-配信終了後、送信成功済みのコメントバッチがすべて分析済みであることを確認し、
+配信終了後、SQS送信前に登録したコメントバッチがすべて分析済みであることを確認し、
 配信全体の分析結果を確定する。
 
 主な責務：
@@ -566,10 +596,17 @@ YouTube Data API
        ↓
 Comments + nextPageToken
        ↓
-       ├──────────────→ SQS
-       │
-       ▼
-Step Functions
+S3 OutboxへPayload保存
+       ↓
+Stream Metadata Lambda
+       ↓
+collection_job_batchesへ送信前登録
+       ↓
+Data Collector Lambda（送信モード）
+       ↓
+      SQS
+       ↓
+送信成功確認
        ↓
       Wait
        ↓
@@ -580,12 +617,16 @@ Data Collector Lambda
 
 Data Collector Lambdaは1回の実行で一定範囲のコメントを取得する。
 
-取得したコメントには内部`streamId`、`collectionJobId`および`batchId`を付与してSQSへ送信する。
+取得したコメントには内部`streamId`、`collectionJobId`および`batchId`を付与し、
+SQSメッセージと同じPayloadをS3 Outboxへ保存する。
 
-Data Collector LambdaはSQSから送信成功応答を受け取った`batchId`をStep Functionsへ返す。
-Step Functionsは取得位置を進める前にStream Metadata Lambdaを呼び出し、
-対象`collectionJobId`の`collection_job_batches`へ`batchId`を冪等に登録する。
-登録に失敗した場合は取得位置を進めず再試行する。
+Step FunctionsはData Collectorから受け取った全分割バッチの記述子を
+Stream Metadata Lambdaへ渡し、`collection_job_batches`へ一つのトランザクションで冪等登録する。
+登録に失敗した場合はSQSへ送信せず、登録処理を再試行する。
+
+登録成功後、Data Collectorの送信モードは登録済みのS3 Outbox PayloadをSQSへ送信する。
+送信成功応答を失った場合もYouTube APIを再取得せず、同じPayloadを再送信する。
+全バッチの送信成功を確認できるまで取得位置を進めない。
 
 次回取得位置を示す`nextPageToken`はStep Functionsの実行状態として保持し、
 次回のLambda呼び出しへ引き継ぐ。
@@ -653,7 +694,7 @@ Analysis Finalizer Lambda
 Step Functionsは`streams.endedAt`および収集終了状態の保存後、
 Analysis Finalizer Lambdaを呼び出す。
 
-Analysis Finalizerは、対象`collectionJobId`の`collection_job_batches`に登録された全`batchId`が
+Analysis Finalizerは、SQS送信前に対象`collectionJobId`の`collection_job_batches`へ登録された全`batchId`が
 `processed_comment_batches`へ登録済みかを確認する。
 未処理バッチがある場合はPENDINGを返し、Step Functionsは10秒待機して再確認する。
 
@@ -731,8 +772,10 @@ Step FunctionsのRetry機能を利用する。
 RetryではBackoffを設定し、
 短時間にAPIを過剰に呼び出さないようにする。
 
-SQS送信後・Task結果返却前の失敗でも、同じ送信内容から同じ`batchId`を再生成する。
-再取得によるバッチの部分的な重複は、AnalyzerのコメントID単位の重複排除で扱う。
+SQS送信後・Task結果返却前の失敗ではYouTube APIを再取得せず、
+`collection_job_batches`に登録済みのS3 Outbox Payloadを再送信する。
+登録前のData Collector失敗ではSQS送信が行われていないため、再取得内容が変わっても未追跡バッチは生じない。
+別の取得結果に同じコメントが含まれる場合は、AnalyzerのコメントID単位の重複排除で扱う。
 
 ### 6.4. 自動配信検出
 
@@ -747,7 +790,7 @@ PoC完了後、EventBridge等を利用した自動化を検討する。
 
 配信またはLive Chatの終了検知時は、そのままEndへ遷移せず、以下を実行する。
 
-1. 取得済みコメントの全分割バッチについて、SQS送信成功と`collection_job_batches`への登録成功を確認する。失敗時は正常終了扱いにしない
+1. 取得済みコメントの全分割バッチについて、SQS送信前の`collection_job_batches`への登録と、その登録済みPayloadのSQS送信成功を確認する。失敗時は正常終了扱いにしない
 2. Step Functionsで`collectionStoppedAt`を一度だけ確定し、Execution ARN、内部`streamId`、`videoId`、停止理由とともに保持する
 3. Data Collectorを最終メタデータ取得モードで呼び出し、`videos.list(part=snippet,liveStreamingDetails, id=videoId)`からタイトル、実開始日時、実終了日時を再取得する。このモードではコメントを再送信しない
 4. Stream Metadata Lambdaへ必要項目を渡し、`streams`の最終メタデータ、対象`collection_jobs`の終了状態および`analysisStatus=FINALIZING`を同一トランザクションで保存する

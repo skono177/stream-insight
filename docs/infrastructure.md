@@ -114,7 +114,13 @@ Step Functions
 
 Data Collector Lambda
          │
-         │ Comments + streamId + batchId
+         │ 1. Outbox Payload保存
+         ▼
+┌──────────────────┐
+│ S3 Outbox        │
+└────────┬─────────┘
+         │
+         │ 2. Auroraへ送信予定登録後、同じPayloadを送信
          ▼
     ┌─────────┐
     │   SQS   │
@@ -292,13 +298,17 @@ PoC時点の主な通信経路は以下とする。
 | コンポーネント         | 接続先                                  | 通信経路                |
 | ---------------------- | --------------------------------------- | ----------------------- |
 | Data Collector Lambda  | YouTube Data API                        | VPC外からインターネット |
-| Data Collector Lambda  | SQS / Parameter Store / Secrets Manager | VPC外からAWSサービス    |
+| Data Collector Lambda  | S3 / SQS / Parameter Store / Secrets Manager | VPC外からAWSサービス |
 | Stream Metadata Lambda | Aurora PostgreSQL Writer Endpoint       | VPC内、TCP 5432         |
 | Analyzer Lambda        | Aurora PostgreSQL Writer Endpoint       | VPC内、TCP 5432         |
 | Analyzer Lambda        | Raw Data S3                             | S3 Gateway VPC Endpoint |
 | Analysis Finalizer Lambda | Aurora PostgreSQL Writer Endpoint    | VPC内、TCP 5432         |
 | API Lambda             | Aurora PostgreSQL Cluster Endpoint      | VPC内、TCP 5432         |
 | Migration Lambda       | RDS Data API / Aurora管理者Secret       | VPC外からAWSサービス    |
+
+Outboxの保存とSQS送信はVPC外のData Collector Lambdaが行い、
+Stream Metadata LambdaはAuroraへの登録だけを行う。
+この変更によるInterface VPC EndpointおよびNAT Gatewayの追加は行わない。
 
 新たにVPC内Lambdaから他のAWSサービスへアクセスする必要が生じた場合は、
 対象サービスのVPC Endpoint追加を検討する。
@@ -321,7 +331,8 @@ PoCでは以下のLambda Functionを作成する。
 - `nextPageToken`取得
 - ポーリング間隔取得
 - コメントバッチ単位の`batchId`生成
-- SQSへのコメントデータ送信
+- S3 OutboxへのコメントバッチPayload保存
+- Auroraへの登録が完了したOutbox PayloadのSQSへの送信
 - Step Functionsへの取得結果返却
 
 想定Function名：
@@ -340,13 +351,14 @@ VPC外へ配置する。
 
 継続取得に必要な`nextPageToken`等はStep Functionsへ返却する。
 
-SQSへ送信するコメントデータには、
-Stream Metadata Lambdaによって採番された内部`streamId`と
-`collectionJobId`、コメントバッチを一意に識別する`batchId`を含める。
+取得したコメントは、内部`streamId`、`collectionJobId`および`batchId`を含む
+SQS送信用Payloadとして、送信前にS3 Outboxへ保存する。
+Data Collectorは`batchId`、Outboxオブジェクトキー、Payload SHA-256をStep Functionsへ返す。
 
-SQSから送信成功応答を受け取った`batchId`の一覧をStep Functionsへ返す。
-Step Functionsは取得位置を進める前にStream Metadata Lambdaを呼び出し、
-対象収集ジョブの`collection_job_batches`へ送信済みバッチを登録する。
+Step FunctionsはStream Metadata Lambdaによる`collection_job_batches`への登録完了後、
+Data Collectorを送信モードで呼び出す。
+送信モードはS3 Outboxから登録済みPayloadを読み出し、SHA-256を検証してSQSへ送信する。
+送信結果が不明な場合もYouTube APIを再取得せず、同じPayloadを再送信する。
 
 ---
 
@@ -359,7 +371,7 @@ Step Functionsは取得位置を進める前にStream Metadata Lambdaを呼び�
 - `streams`の作成・更新
 - 終了時の最終メタデータ（`endedAt`を含む）更新
 - Execution ARNを一意キーとする`collection_jobs`の開始登録・終了状態更新
-- SQS送信成功済み`batchId`の`collection_job_batches`への冪等登録
+- SQS送信前の`batchId`、Outboxオブジェクトキー、Payload SHA-256の`collection_job_batches`への冪等登録
 - 内部`channelId`の採番・取得
 - 内部`streamId`の採番・取得
 - Step Functionsへの内部`streamId`および`collectionJobId`返却
@@ -517,6 +529,7 @@ stream-insight-dev-collection-workflow
 - 配信メタデータ永続化
 - 内部`streamId`の保持
 - Data Collector Lambdaの繰り返し実行
+- S3 Outboxへの保存、Auroraへの送信前登録、登録済みPayloadのSQS送信の順序制御
 - `nextPageToken`の保持
 - ポーリング間隔の制御
 - 配信終了判定
@@ -543,6 +556,15 @@ internal streamId
   ↓
 Collect Comments
 (Data Collector Lambda)
+  ↓
+Save Outbox Payload
+(S3)
+  ↓
+Register Outbox Batch
+(Stream Metadata Lambda)
+  ↓
+Send Registered Payload
+(Data Collector Lambda → SQS)
   ↓
 Live Chat終了？
   ├── Yes
@@ -600,6 +622,10 @@ YouTube Data APIへのアクセスで一時的なエラーが発生した場合�
 Step FunctionsのRetry機能を利用する。
 
 RetryではBackoffを設定する。
+
+Outbox登録後のSQS送信が失敗した場合、または送信成功応答を受け取れなかった場合は、
+登録済みの同じS3 Outbox Payloadを再送信する。
+送信処理のRetryではYouTube Data APIを再取得しない。
 
 収集TaskのRetry上限到達時はCatchで終了処理へ進み、
 収集失敗状態を保存してからState Machine Executionを失敗として終了させる。
@@ -660,6 +686,9 @@ SQSメッセージには対象配信を識別する内部`streamId`と、
 Standard Queueでは同じメッセージが複数回配信される可能性があるため、
 Analyzer Lambda側で`batchId`を利用した冪等性制御を行う。
 
+各メッセージは、S3 OutboxへのPayload保存と`collection_job_batches`への登録が
+完了した後にだけ送信する。
+
 Analyzer LambdaのEvent Source Mappingでは
 Partial Batch Responseを有効化する。
 
@@ -696,14 +725,16 @@ stream-insight-raw-<account-id>
 想定構成：
 
 ```text
+outbox/
+└── youtube/collection-jobs/<collection-job-id>/batches/<batch-id>.json
+
 raw/
-└── youtube/
-    └── streams/
-        └── <stream-id>/
-            └── batches/
-                ├── <batch-id-1>.jsonl
-                └── <batch-id-2>.jsonl
+└── youtube/streams/<stream-id>/batches/<batch-id>.jsonl
 ```
+
+`outbox/`にはData Collector LambdaがSQS送信前のPayloadを条件付き書き込みで保存する。
+同じキーが既に存在する場合はPayload SHA-256が一致するときだけ再利用し、
+異なる場合は上書きせず失敗させる。
 
 S3オブジェクトキーには`batchId`を利用する。
 
@@ -720,6 +751,8 @@ Stream Insightのデータ保持方針に従い、
 
 S3 Lifecycle Ruleを設定し、
 7日経過後に自動削除する。
+
+コメント本文を含む`outbox/`にも同じ7日保持のLifecycle Ruleを設定する。
 
 ```text
 Raw Data
@@ -746,6 +779,8 @@ Block Public Access: ON
 ```
 
 アクセスはIAM Roleを付与されたLambda等に限定する。
+
+VPC外のData Collector Lambdaには`outbox/`に対するPutObject / GetObjectだけを許可する。
 
 Analyzer LambdaからRaw Data Bucketへのアクセスは、
 S3 Gateway VPC Endpoint経由とする。
@@ -774,6 +809,7 @@ PostgreSQL
 - comment_length_distribution
 - frequent_words
 - collection_jobs
+- collection_job_batches
 - processed_comment_batches
 - processed_comments
 
@@ -792,6 +828,9 @@ Standard SQSによる重複配信に対応するため処理済み`batchId`を�
 Data Collectorの再実行時は、`data-model.md`の7.1節に従い同じ送信内容から同じ`batchId`を生成する。
 再取得時にバッチ構成が変わった場合は、`processed_comments`の`(streamId, commentId)`一意制約で重複を排除する。
 新規コメントの処理済み登録と分析結果更新も同一トランザクションで実行する。
+
+`collection_job_batches`にはSQS送信前に`batchId`、Outboxオブジェクトキーおよび
+Payload SHA-256を登録する。Stream Metadata Lambdaでの登録Commit後にだけSQS送信を開始する。
 
 `nextPageToken`等のLambda間の継続処理状態については、
 Step Functionsの実行状態で管理するため、
@@ -1215,6 +1254,8 @@ Secrets Manager Interface VPC Endpointは作成しない。
 ### Data Collector Lambda
 
 ```text
+S3 PutObject / GetObject
+Resource: <Raw Data Bucket ARN>/outbox/*
 SQS SendMessage
 SSM GetParameter
 Secrets Manager GetSecretValue
@@ -1286,7 +1327,8 @@ S3 Gateway VPC EndpointのEndpoint Policyでは、
 Raw Data Bucketへの必要なアクセスのみを許可する。
 
 Raw Data BucketのBucket Policyについても、
-Analyzer LambdaからのRaw Data保存に必要なアクセスのみを許可する。
+Data Collector Lambdaによる`outbox/`の読み書きと、
+Analyzer Lambdaによる`raw/`へのRaw Data保存に必要なアクセスのみを許可する。
 
 最小権限の原則を適用する。
 
