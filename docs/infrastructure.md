@@ -966,7 +966,79 @@ Analyzer LambdaからのRaw Data保存に必要なアクセスのみを許可す
 
 ## 15. ログ・監視
 
-LambdaおよびStep FunctionsのログはCloudWatchへ出力する。
+Lambda、API GatewayおよびStep FunctionsのログはCloudWatch Logsへ出力する。
+
+PoCではログを無期限に保持せず、
+CDKによって各Log Groupの保持期間と削除ポリシーを明示的に設定する。
+
+### 15.1. ログ保持期間
+
+PoCではCloudWatch Logsの保持期間を以下とする。
+
+| ログ                         | 保持期間 | スタック削除時 |
+| ---------------------------- | -------: | -------------- |
+| Data Collector Lambda        |      7日 | 削除           |
+| Stream Metadata Lambda       |      7日 | 削除           |
+| Analyzer Lambda              |      7日 | 削除           |
+| API Lambda                   |      7日 | 削除           |
+| API Gateway Access Log       |      7日 | 削除           |
+| Step Functions Execution Log |      7日 | 削除           |
+
+CDKでは各Log Groupに対して以下を設定する。
+
+```text
+Retention: 7 days
+Removal Policy: DESTROY
+```
+
+Lambdaのロググループについても、
+Lambdaによる暗黙的な無期限保持に依存せず、
+CDK管理下で保持期間を明示する。
+
+PoCの`dev`環境では、
+CloudFormation Stack削除時に対象Log Groupも削除する。
+
+本番環境を構築する場合は、
+監査・障害調査要件を確認したうえで保持期間およびRemoval Policyを再設計する。
+
+---
+
+### 15.2. ログ出力方針
+
+ログには運用・障害調査に必要な情報のみを出力する。
+
+以下はログへ出力しない。
+
+- コメント本文
+- YouTube APIレスポンス全体
+- SQSメッセージ本文全体
+- Raw Data
+- OAuth Client Secret
+- Refresh Token
+- Access Token
+- YouTube Data API Key
+- その他の認証情報
+
+コメント処理の追跡が必要な場合は、
+本文ではなく以下のような処理管理用情報を利用する。
+
+```text
+streamId
+batchId
+処理件数
+処理時間
+処理結果
+エラー種別
+```
+
+エラー発生時も、
+外部APIレスポンスやSQSメッセージをそのままログへ出力しない。
+
+必要なエラーコードやステータス等のみを抽出して記録する。
+
+---
+
+### 15.3. 監視対象
 
 主な監視対象：
 
@@ -985,8 +1057,6 @@ LambdaおよびStep FunctionsのログはCloudWatchへ出力する。
 - YouTube APIエラー
 - OAuth 2.0 Token取得エラー
 
-OAuth Client Secret、Refresh Token、Access Token等の認証情報はログへ出力しない。
-
 PoCでは最低限のCloudWatch Alarmを設定する。
 
 対象：
@@ -1000,7 +1070,7 @@ SQS DLQ Messages
 
 ---
 
-### 15.1. コスト監視
+### 15.4. コスト監視
 
 PoCの想定外利用による課金増加を早期に検知するため、
 AWS Budgetsを設定する。
@@ -1053,6 +1123,9 @@ infrastructure/
 └── tsconfig.json
 ```
 
+CloudWatch LogsについてもCDK管理対象とし、
+保持期間およびRemoval Policyをコード上で明示する。
+
 ---
 
 ## 17. CDK Stack構成
@@ -1088,10 +1161,20 @@ PoCでは以下のStack構成を基本とする。
 - Step Functions State Machine
 - API Gateway
 - API Gateway Throttling
+- Lambda Log Groups
+- API Gateway Access Log Group
+- Step Functions Log Group
 - Parameter Store
 - Secrets Manager
 - CloudWatch Alarm
 - AWS Budget
+
+CloudWatch Log Groupsには以下を設定する。
+
+```text
+Retention: 7 days
+Removal Policy: DESTROY
+```
 
 Analyzer LambdaのSQS Event Source Mappingでは
 Partial Batch Responseを有効化する。
@@ -1184,7 +1267,8 @@ PoCでは以下を重視する。
 - API LambdaにReserved Concurrencyを設定する
 - AWS Budgetsでコストを監視する
 - Auroraのキャパシティを必要最小限にする
-- CloudWatch Logsの不要な長期保存を避ける
+- CloudWatch Logsの保持期間を7日に設定する
+- PoCのdev Stack削除時にCloudWatch Log Groupsを削除する
 - Secrets Managerに保存するSecret数を必要最小限にする
 
 ---
