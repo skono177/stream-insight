@@ -90,7 +90,7 @@ PoCでは以下のAWSサービスを利用する。
 
 Data Collector Lambda
          │
-         │ Comments + streamId
+         │ Comments + streamId + batchId
          ▼
     ┌─────────┐
     │   SQS   │
@@ -222,6 +222,7 @@ PoCでは以下のLambda Functionを作成する。
 - コメント取得
 - `nextPageToken`取得
 - ポーリング間隔取得
+- コメントバッチ単位の`batchId`生成
 - SQSへのコメントデータ送信
 - Step Functionsへの取得結果返却
 
@@ -242,7 +243,8 @@ VPC外へ配置する。
 継続取得に必要な`nextPageToken`等はStep Functionsへ返却する。
 
 SQSへ送信するコメントデータには、
-Stream Metadata Lambdaによって採番された内部`streamId`を含める。
+Stream Metadata Lambdaによって採番された内部`streamId`と
+コメントバッチを一意に識別する`batchId`を含める。
 
 ---
 
@@ -277,10 +279,12 @@ Stream Metadata LambdaはAuroraへの接続が必要となるためVPC内へ配�
 役割：
 
 - SQSメッセージ受信
+- `batchId`による処理済み判定
 - Raw Data生成
 - S3への保存
 - コメント分析
 - Auroraへの分析結果保存
+- 処理済み`batchId`の保存
 
 想定Function名：
 
@@ -290,6 +294,22 @@ stream-insight-analyzer
 
 SQSメッセージに含まれる内部`streamId`を利用して、
 対象配信の分析結果を保存する。
+
+Standard SQSの重複配信に対応するため、
+Auroraの`processed_comment_batches`テーブルで処理済み`batchId`を管理する。
+
+分析結果の更新と処理済み`batchId`の登録は、
+同一のAuroraトランザクションで実行する。
+
+既に処理済みの`batchId`を受信した場合は、
+分析結果を再更新せず正常終了する。
+
+Raw DataのS3オブジェクトキーには`batchId`を利用し、
+同一バッチの再処理時にも同じオブジェクトへ保存する。
+
+SQS Event Source MappingではPartial Batch Responseを有効化し、
+Lambdaへ渡された複数メッセージの一部が失敗した場合は、
+失敗したメッセージのみを再試行対象とする。
 
 Auroraへの接続が必要となるためVPC内へ配置する。
 
@@ -440,8 +460,14 @@ stream-insight-comment-queue
 
 PoCでは複数コメントを1つのSQSメッセージとして送信する。
 
-SQSメッセージには対象配信を識別するため、
-内部`streamId`を含める。
+SQSメッセージには対象配信を識別する内部`streamId`と、
+コメントバッチを一意に識別する`batchId`を含める。
+
+Standard Queueでは同じメッセージが複数回配信される可能性があるため、
+Analyzer Lambda側で`batchId`を利用した冪等性制御を行う。
+
+Analyzer LambdaのEvent Source Mappingでは
+Partial Batch Responseを有効化する。
 
 ---
 
@@ -475,9 +501,15 @@ raw/
 └── youtube/
     └── streams/
         └── <stream-id>/
-            ├── comments-001.jsonl
-            └── comments-002.jsonl
+            └── batches/
+                ├── <batch-id-1>.jsonl
+                └── <batch-id-2>.jsonl
 ```
+
+S3オブジェクトキーには`batchId`を利用する。
+
+同一SQSメッセージが再処理された場合でも同一キーへ保存することで、
+Raw Dataの重複オブジェクト生成を防止する。
 
 ---
 
@@ -537,11 +569,19 @@ PostgreSQL
 - comment_length_distribution
 - frequent_words
 - collection_jobs
+- processed_comment_batches
 
 コメント原データは保存しない。
 
 YouTube Channel IDおよびVideo IDを外部IDとして保持し、
 内部`channelId`および`streamId`はAurora側で採番する。
+
+`processed_comment_batches`では、
+Standard SQSによる重複配信に対応するため処理済み`batchId`を管理する。
+
+`batchId`には一意制約を設定し、
+分析結果の更新と処理済み`batchId`の登録を
+同一トランザクションで実行する。
 
 `nextPageToken`等のLambda間の継続処理状態については、
 Step Functionsの実行状態で管理するため、
@@ -860,6 +900,9 @@ PoCでは以下のStack構成を基本とする。
 - API Gateway
 - Parameter Store
 - Secrets Manager
+
+Analyzer LambdaのSQS Event Source Mappingでは
+Partial Batch Responseを有効化する。
 
 ### FrontendStack
 

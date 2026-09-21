@@ -75,7 +75,7 @@ PoCではJSON Lines（JSONL）形式を基本とする。
 
 ### 3.4. S3オブジェクト構成
 
-PoCでは以下のような構成を想定する。
+PoCでは`batchId`を利用して以下のような構成とする。
 
 ```text
 s3://<bucket>/
@@ -83,10 +83,15 @@ s3://<bucket>/
     └── youtube/
         └── streams/
             └── <stream-id>/
-                ├── comments-001.jsonl
-                ├── comments-002.jsonl
-                └── ...
+                └── batches/
+                    ├── <batch-id-1>.jsonl
+                    ├── <batch-id-2>.jsonl
+                    └── ...
 ```
+
+S3オブジェクトキーを`batchId`から決定することで、
+同じSQSメッセージが再処理された場合でも同一オブジェクトへ保存し、
+重複したRaw Dataオブジェクトの生成を防止する。
 
 実際のバケット名・パス構成はインフラ実装時に決定する。
 
@@ -238,6 +243,29 @@ YouTubeからのデータ収集処理を管理するための情報を表す。
 
 ---
 
+### 4.8. Processed Comment Batch
+
+SQSメッセージの重複配信による分析結果の二重更新を防止するため、
+処理済みのコメントバッチを管理する。
+
+主な情報：
+
+- Batch ID
+- Stream ID
+- 処理日時
+
+`batchId`には一意制約を設定する。
+
+Analyzer Lambdaは分析結果を更新する際、
+分析結果の更新とProcessed Comment Batchの登録を
+同一のAuroraトランザクション内で実行する。
+
+既に同じ`batchId`が登録されている場合は、
+そのコメントバッチを処理済みと判断し、
+分析結果を再更新しない。
+
+---
+
 ## 5. エンティティ間の関係
 
 ```text
@@ -253,7 +281,9 @@ Channel
            │
            ├──< Frequent Words
            │
-           └──< Collection Job
+           ├──< Collection Job
+           │
+           └──< Processed Comment Batch
 ```
 
 コメント原データについてはAuroraには保存せず、S3上のRaw Dataとして管理する。
@@ -284,6 +314,9 @@ S3
 
 YouTubeから取得したコメントデータをS3へ原データとして保存する。
 
+S3オブジェクトキーには`batchId`を利用し、
+同じコメントバッチが再処理された場合も同一オブジェクトへ保存する。
+
 ---
 
 ### 6.2. Analysis Data
@@ -293,12 +326,17 @@ SQS
  ↓
 Analyzer Lambda
  ↓
+batchId確認
+ ↓
 分析処理
  ↓
 Aurora PostgreSQL
 ```
 
 Analyzer Lambdaはコメントデータを分析し、Web UIおよびAPIから利用する分析結果をAurora PostgreSQLへ保存する。
+
+分析結果の更新と`processed_comment_batches`への`batchId`登録は
+同一のAuroraトランザクションで実行する。
 
 ---
 
@@ -308,11 +346,15 @@ Data Collector LambdaからAnalyzer Lambdaへコメントデータを受け渡�
 
 PoCでは、複数のコメントを1メッセージにまとめる方式を基本とする。
 
+各メッセージにはコメントバッチを一意に識別する`batchId`を含める。
+
 例：
 
 ```json
 {
+  "batchId": "550e8400-e29b-41d4-a716-446655440000",
   "streamId": "stream-001",
+  "videoId": "youtube-video-id",
   "comments": [
     {
       "commentId": "comment-001",
@@ -327,6 +369,12 @@ PoCでは、複数のコメントを1メッセージにまとめる方式を基�
   ]
 }
 ```
+
+`batchId`はData Collector Lambdaでコメントバッチを生成する際に一度だけ生成し、
+Analyzer Lambdaでは再生成しない。
+
+SQSの再配信時にも同じ`batchId`を利用することで、
+Analyzer Lambdaが処理済みメッセージを判定できるようにする。
 
 SQSのメッセージサイズやコメント量に応じて、1メッセージあたりのコメント数は実装時に調整する。
 
@@ -344,17 +392,17 @@ channels
     └── streams
            │
            ├── stream_metrics
-           │
            ├── comment_timeline
-           │
            ├── comment_length_distribution
-           │
            ├── frequent_words
-           │
-           └── collection_jobs
+           ├── collection_jobs
+           └── processed_comment_batches
 ```
 
 コメント原データはAuroraではなくS3に保存する。
+
+`processed_comment_batches`はRaw Dataそのものではなく、
+SQSメッセージの冪等処理を実現するための処理管理情報として保存する。
 
 ---
 
@@ -418,6 +466,22 @@ API・Web UIからの高速な参照
 
 ---
 
+### 9.5. 冪等性
+
+Standard SQSでは同一メッセージが複数回配信される可能性があるため、
+コメントバッチ単位で`batchId`を付与する。
+
+Analyzer Lambdaでは`processed_comment_batches`を利用して
+処理済み`batchId`を判定する。
+
+分析結果の更新と処理済み`batchId`の登録は
+同一のAuroraトランザクションで実行する。
+
+S3については`batchId`から決定されるオブジェクトキーを使用し、
+再処理時にも同じオブジェクトへ保存する。
+
+---
+
 ## 10. データ保持方針
 
 ### 10.1. Raw Data
@@ -444,6 +508,9 @@ Stream Insightでは安全性を考慮し、独自に7暦日を保存上限と�
 データ収集処理の状態を管理するために保存する。
 
 収集処理の再実行や障害発生時の調査に利用する。
+
+`processed_comment_batches`についても、
+SQSメッセージの重複処理を防止するための処理管理情報として保存する。
 
 ---
 

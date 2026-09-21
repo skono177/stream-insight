@@ -71,7 +71,7 @@ PoC後に以下へ拡張可能な構成とする。
 
 Data Collector Lambda
          │
-         │ Comments + streamId
+         │ Comments + streamId + batchId
          ▼
 ┌──────────────────┐
 │       SQS        │
@@ -218,6 +218,7 @@ YouTube Data APIから対象配信のデータを取得する。
 - コメント取得
 - `nextPageToken`の取得
 - ポーリング間隔の取得
+- コメントバッチ単位の`batchId`生成
 - コメントデータのSQSへの送信
 - Step Functionsへの取得結果返却
 
@@ -242,7 +243,11 @@ Data Collector Lambda自身では配信終了まで待機しない。
 取得継続に必要な`nextPageToken`等をStep Functionsへ返却する。
 
 コメントをSQSへ送信する際には、
-Stream Metadata Lambdaによって採番された内部`streamId`を含める。
+Stream Metadata Lambdaによって採番された内部`streamId`と、
+コメントバッチを一意に識別する`batchId`を含める。
+
+`batchId`はData Collector Lambdaでコメントバッチを生成した時点で一度だけ生成し、
+SQSの再配信時にも同じ値を利用できるようメッセージに含める。
 
 これによりAnalyzer Lambdaは外部Video IDから内部`streamId`を解決する必要がない。
 
@@ -306,15 +311,19 @@ Stream Metadata LambdaはAuroraへアクセスするためVPC内へ配置する�
 
 PoCでは、複数のコメントを1メッセージにまとめて送信する方式を基本とする。
 
-SQSへ送信するコメントデータには内部`streamId`を含める。
+SQSへ送信するコメントデータには内部`streamId`および`batchId`を含める。
 
 概念的なメッセージ：
 
 ```text
+batchId
 streamId
 videoId
 comments
 ```
+
+Standard Queueでは同一メッセージが複数回配信される可能性があるため、
+Analyzer Lambdaでは`batchId`を利用して冪等性を確保する。
 
 ---
 
@@ -326,12 +335,36 @@ SQSからコメントデータを取得し、
 主な責務：
 
 - SQSからコメントデータを取得
+- `batchId`による処理済み判定
 - コメント原データをS3へ保存
 - コメントデータの集計・分析
 - 分析結果をAurora PostgreSQLへ保存
+- 処理済み`batchId`をAurora PostgreSQLへ保存
 
 Analyzer LambdaはSQSメッセージに含まれる内部`streamId`を利用して、
 対象配信の分析結果を保存する。
+
+Standard SQSによるメッセージの重複配信に対応するため、
+`processed_comment_batches`テーブルで処理済み`batchId`を管理する。
+
+分析結果の更新と`processed_comment_batches`への処理済み登録は、
+同一のAuroraトランザクション内で実行する。
+
+既に処理済みの`batchId`を受信した場合は、
+分析結果を再更新せず正常終了する。
+
+S3へのRaw Data保存では`batchId`から決定されるオブジェクトキーを利用する。
+
+```text
+raw/youtube/streams/<stream-id>/batches/<batch-id>.jsonl
+```
+
+同じSQSメッセージが再処理された場合でも同じオブジェクトキーを使用することで、
+Raw Dataの重複オブジェクト生成を防止する。
+
+SQS Event Source MappingではPartial Batch Responseを有効にし、
+複数メッセージの一部で処理に失敗した場合は、
+失敗したメッセージのみを再試行対象とする。
 
 主な分析：
 
@@ -357,6 +390,9 @@ YouTube Liveから取得したコメント等の原データを保存する。
 S3には主に分析処理の入力となる原データを保存し、
 Web UIから頻繁に参照する分析結果は保存しない。
 
+Raw Dataのオブジェクトキーには`batchId`を利用し、
+同一バッチを再処理した場合でも同一オブジェクトへ保存する。
+
 保存形式、オブジェクト構成および保持期間の詳細は`data-model.md`で定義する。
 
 ---
@@ -372,6 +408,7 @@ Web UIやAPIから利用する分析結果およびアプリケーションデ�
 - コメント集計結果
 - 時間帯別コメント数
 - 頻出ワード
+- コメントバッチ処理済み情報
 - その他のBI表示用データ
 
 大量のコメント原データはAuroraには保存せず、S3に保存する。
@@ -484,7 +521,7 @@ Data Collector Lambda
 
 Data Collector Lambdaは1回の実行で一定範囲のコメントを取得する。
 
-取得したコメントには内部`streamId`を付与してSQSへ送信する。
+取得したコメントには内部`streamId`および`batchId`を付与してSQSへ送信する。
 
 次回取得位置を示す`nextPageToken`はStep Functionsの実行状態として保持し、
 次回のLambda呼び出しへ引き継ぐ。
@@ -499,22 +536,34 @@ Data Collector Lambdaは1回の実行で一定範囲のコメントを取得す�
                      SQS
                       ↓
                Analyzer Lambda
+                      ↓
+               batchId確認
                   ↙       ↘
                  ↓         ↓
                 S3      Aurora PostgreSQL
                  ↓         ↓
           コメント原データ   分析結果
+                              +
+                      processed_comment_batches
 ```
 
 Analyzer LambdaがSQSからコメントデータを取得し、以下の処理を行う。
 
-1. コメント原データをS3へ保存する
-2. コメントデータを分析する
-3. SQSメッセージの内部`streamId`を利用して分析結果をAurora PostgreSQLへ保存する
+1. `batchId`が処理済みか確認する
+2. 未処理の場合、`batchId`から決定されるS3オブジェクトキーへコメント原データを保存する
+3. コメントデータを分析する
+4. 分析結果の更新と`batchId`の処理済み登録を同一Auroraトランザクションで実行する
+5. 処理済みの場合は分析結果を再更新せず正常終了する
 
-コメント原データと分析結果を保存先ごとに分離することで、
-大量のコメントデータを低コストで保持しながら、
-Web UIから必要な分析結果を取得できる構成とする。
+S3保存後に処理が失敗した場合でも、
+再実行時には同一オブジェクトキーへ保存する。
+
+AuroraトランザクションがCommitされる前に失敗した場合はRollbackされ、
+再実行時に再度処理する。
+
+AuroraトランザクションのCommit後にSQSメッセージが再配信された場合は、
+`processed_comment_batches`によって処理済みと判定し、
+分析結果の二重更新を防止する。
 
 ---
 
