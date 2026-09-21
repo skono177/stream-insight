@@ -304,6 +304,7 @@ GET /api/streams/{streamId}/metrics
   "totalComments": 12500,
   "averageCommentLength": 12.8,
   "averageCommentsPerMinute": 104.2,
+  "analysisStartAt": "2026-08-23T15:00:20Z",
   "analysisEndAt": "2026-08-23T17:00:00Z",
   "analysisStatus": "COMPLETED"
 }
@@ -314,12 +315,16 @@ GET /api/streams/{streamId}/metrics
 - 総コメント数
 - 平均コメント文字数
 - 平均コメント速度
-- 分析基準日時
+- 分析対象開始日時
+- 分析基準終了日時
 - 分析状態
 - その他の配信単位の指標
 
 `averageCommentsPerMinute`は、
-`[startedAt, analysisEndAt)`に含まれる総コメント数を同期間の分数で除して算出する。
+`[analysisStartAt, analysisEndAt)`に含まれる総コメント数を同期間の分数で除して算出する。
+`analysisStartAt`は配信の実開始日時とコメントの観測開始日時の遅い方であり、
+配信開始後に収集を開始した場合は`startedAt`より後になる。
+`analysisStartAt`より前は未観測期間であり、コメント0件として扱わない。
 配信終了後の確定値では`analysisEndAt`に実終了日時を使用する。
 配信中の値は`analysisEndAt`時点の暫定値とする。
 
@@ -358,6 +363,7 @@ GET /api/streams/{streamId}/timeline
 {
   "streamId": "stream-001",
   "unit": "minute",
+  "analysisStartAt": "2026-08-23T15:00:20Z",
   "analysisEndAt": "2026-08-23T15:02:00Z",
   "analysisStatus": "PENDING",
   "items": [
@@ -379,15 +385,18 @@ GET /api/streams/{streamId}/timeline
 
 タイムラインはUTCの正分を基準とする1分区間で返す。
 各項目は開始日時を含み、終了日時を含まない半開区間`[startAt, endAt)`とする。
-配信開始を含む最初の区間と`analysisEndAt`直前までの最後の区間は、
+観測開始を含む最初の区間と`analysisEndAt`直前までの最後の区間は、
 配信の分析対象期間と重なる部分だけを返すため、60秒未満になる場合がある。
+タイムラインの対象期間は`[analysisStartAt, analysisEndAt)`とし、
+`analysisStartAt`より前の区間は返さない。
 
 コメントがない区間も省略せず、`commentCount`と`commentsPerMinute`を`0`として返す。
 部分区間の`commentsPerMinute`は、
 `commentCount * 60 / (endAt - startAtの秒数)`で1分あたりに換算する。
-全体平均およびタイムラインは同じ`analysisEndAt`を使用する。
+全体平均およびタイムラインは同じ`analysisStartAt`と`analysisEndAt`を使用する。
 `analysisStatus`がCOMPLETEDになるまではタイムラインを暫定値として扱う。
-COMPLETEDの場合は、送信済みバッチの分析完了確認と終了時刻までの0件区間補完が完了しており、
+COMPLETEDの場合は、送信済みバッチの分析完了確認と
+`analysisStartAt`から終了時刻までの0件区間補完が完了しており、
 `analysisEndAt`は`endedAt`と一致する。
 
 ---

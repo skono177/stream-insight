@@ -164,6 +164,7 @@ videoId
 liveChatId
 nextPageToken
 pollingInterval
+observationStartedAt
 collectionStatus
 analysisStatus
 ```
@@ -242,6 +243,7 @@ YouTube Data APIから対象配信のデータを取得する。
 - 配信情報取得
 - Live Chat ID取得
 - コメント取得
+- 初回の正常なコメント取得要求に対応する`observationStartedAt`の返却
 - `nextPageToken`の取得
 - ポーリング間隔の取得
 - コメントバッチ単位の`batchId`生成
@@ -268,6 +270,10 @@ Data Collector Lambda自身では配信終了まで待機しない。
 
 1回のLambda実行では一定範囲のLive Chatを取得して処理を終了し、
 取得継続に必要な`nextPageToken`等をStep Functionsへ返却する。
+
+初回のコメント取得では、YouTube API要求を送る直前のUTC日時を候補値として保持する。
+要求が正常終了した場合だけ、その候補値を`observationStartedAt`として返す。
+初回レスポンスにそれ以前のコメントが含まれても、分析対象には含めない。
 
 取得したコメントは、SQSへ直接送信する前に、
 内部`streamId`、`collectionJobId`および`batchId`を含む送信Payloadとして
@@ -316,6 +322,7 @@ Aurora PostgreSQLへ永続化する。
 - 内部`streamId`の採番・取得
 - 内部`streamId`および`collectionJobId`をStep Functionsへ返却
 - SQS送信前の`batchId`、OutboxオブジェクトキーおよびPayload SHA-256の`collection_job_batches`への冪等登録
+- `collection_jobs.observationStartedAt`および`stream_metrics.analysisStartAt`の初回保存
 - `collection_jobs`の開始登録および終了状態更新
 - 終了時の`streams.endedAt`を含む最終メタデータ更新
 
@@ -326,6 +333,12 @@ Aurora PostgreSQLへ永続化する。
 コメントバッチの登録はSQS送信前に行い、同じ登録要求の再実行では既存行を返す。
 同じ`collectionJobId`と`batchId`に異なるオブジェクトキーまたはPayload SHA-256が指定された場合は、
 既存行を上書きせずエラーとする。
+
+初回の正常な取得後、Outbox登録要求と同じStream Metadata Lambda呼び出しで
+`observationStartedAt`を`collection_jobs`へ保存し、
+`streams.startedAt`と`observationStartedAt`の遅い方を`stream_metrics.analysisStartAt`へ設定する。
+取得コメントが0件で登録対象バッチがない場合も、この保存処理を実行する。
+再試行や後続取得では既存値を変更しない。
 
 終了時の`streams`更新と`collection_jobs`更新は同一Auroraトランザクションで確定する。
 同じ終了要求を再実行しても重複レコードを作成せず、確定済みの終了情報を消さない。
@@ -527,7 +540,7 @@ Aurora PostgreSQLから分析結果を取得してレスポンスを返す。
 
 - `collection_job_batches`と`processed_comment_batches`の突合
 - 未処理バッチがある場合の待機判定返却
-- `streams.endedAt`までのコメント0件区間の補完
+- `stream_metrics.analysisStartAt`から`streams.endedAt`までのコメント0件区間の補完
 - 部分区間を含むコメント速度の再計算
 - `stream_metrics.analysisEndAt`の`streams.endedAt`への固定
 - `collection_jobs.analysisStatus`および`analysisFinalizedAt`の更新
@@ -617,6 +630,11 @@ Data Collector Lambda
 
 Data Collector Lambdaは1回の実行で一定範囲のコメントを取得する。
 
+初回の正常な取得では、取得要求の開始日時を`observationStartedAt`として一度だけ確定する。
+Step Functionsはこの値を実行状態に保持し、Stream Metadata Lambdaによって
+`collection_jobs.observationStartedAt`へ保存する。
+`stream_metrics.analysisStartAt`には`streams.startedAt`と`observationStartedAt`の遅い方を保存する。
+
 取得したコメントには内部`streamId`、`collectionJobId`および`batchId`を付与し、
 SQSメッセージと同じPayloadをS3 Outboxへ保存する。
 
@@ -698,8 +716,10 @@ Analysis Finalizerは、SQS送信前に対象`collectionJobId`の`collection_job
 `processed_comment_batches`へ登録済みかを確認する。
 未処理バッチがある場合はPENDINGを返し、Step Functionsは10秒待機して再確認する。
 
-未処理バッチが0件になった場合は、`streams.endedAt`までの空区間を補完し、
+未処理バッチが0件になった場合は、`stream_metrics.analysisStartAt`から
+`streams.endedAt`までの空区間だけを補完し、
 全体平均およびタイムラインを再計算して`analysisEndAt`を`endedAt`へ固定する。
+`analysisStartAt`より前は未観測期間として扱い、0件区間を作成しない。
 同じ確定要求の再実行では確定済み結果を重複更新しない。
 
 DLQへの移動等で未処理バッチが残ったまま待機開始から30分を超えた場合、
@@ -753,6 +773,7 @@ Data Collector Lambdaは短時間の処理単位として実行し、
 
 - 対象Live Chatが有効である
 - 次回取得可能な状態である
+- `observationStartedAt`以降の`nextPageToken`系列を欠落なく継続している
 - ワークフローが異常終了していない
 
 ### 6.2. 停止条件
@@ -795,7 +816,7 @@ PoC完了後、EventBridge等を利用した自動化を検討する。
 3. Data Collectorを最終メタデータ取得モードで呼び出し、`videos.list(part=snippet,liveStreamingDetails, id=videoId)`からタイトル、実開始日時、実終了日時を再取得する。このモードではコメントを再送信しない
 4. Stream Metadata Lambdaへ必要項目を渡し、`streams`の最終メタデータ、対象`collection_jobs`の終了状態および`analysisStatus=FINALIZING`を同一トランザクションで保存する
 5. Analysis Finalizer Lambdaで送信済みバッチの分析完了を確認する。未処理の場合は10秒待機して再確認する
-6. 未処理バッチが0件になったら、終了時刻までの分析結果と`analysisEndAt`を確定し、`analysisStatus=COMPLETED`の保存成功後にのみ正常終了する
+6. 未処理バッチが0件になったら、`analysisStartAt`から終了時刻までの分析結果と`analysisEndAt`を確定し、`analysisStatus=COMPLETED`の保存成功後にのみ正常終了する
 
 `streams.endedAt`には`liveStreamingDetails.actualEndTime`をUTCで保存する。
 収集停止時刻、現在時刻、予定終了時刻を代用しない。

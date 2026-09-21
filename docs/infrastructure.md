@@ -328,6 +328,7 @@ PoCでは以下のLambda Functionを作成する。
 - 配信情報取得
 - Live Chat ID取得
 - コメント取得
+- 初回の正常なコメント取得要求に対応する`observationStartedAt`の返却
 - `nextPageToken`取得
 - ポーリング間隔取得
 - コメントバッチ単位の`batchId`生成
@@ -371,6 +372,7 @@ Data Collectorを送信モードで呼び出す。
 - `streams`の作成・更新
 - 終了時の最終メタデータ（`endedAt`を含む）更新
 - Execution ARNを一意キーとする`collection_jobs`の開始登録・終了状態更新
+- `collection_jobs.observationStartedAt`および`stream_metrics.analysisStartAt`の初回保存
 - SQS送信前の`batchId`、Outboxオブジェクトキー、Payload SHA-256の`collection_job_batches`への冪等登録
 - 内部`channelId`の採番・取得
 - 内部`streamId`の採番・取得
@@ -460,7 +462,7 @@ Auroraへの接続が必要となるためVPC内へ配置する。
 
 - `collection_job_batches`と`processed_comment_batches`の突合
 - 未処理バッチが残る場合のPENDING返却
-- 終了時刻までのコメント0件区間の補完
+- `stream_metrics.analysisStartAt`から終了時刻までのコメント0件区間の補完
 - コメント速度および全体平均の再計算
 - `stream_metrics.analysisEndAt`の`streams.endedAt`への固定
 - `collection_jobs.analysisStatus`と`analysisFinalizedAt`の更新
@@ -530,6 +532,7 @@ stream-insight-dev-collection-workflow
 - 内部`streamId`の保持
 - Data Collector Lambdaの繰り返し実行
 - S3 Outboxへの保存、Auroraへの送信前登録、登録済みPayloadのSQS送信の順序制御
+- 初回の正常な取得で確定した`observationStartedAt`の保持・永続化
 - `nextPageToken`の保持
 - ポーリング間隔の制御
 - 配信終了判定
@@ -598,12 +601,20 @@ videoId
 liveChatId
 nextPageToken
 pollingInterval
+observationStartedAt
 collectionStatus
 analysisStatus
 ```
 
 これによりLambdaの実行時間上限を超える長時間配信についても、
 Lambdaを複数回呼び出すことで収集を継続できる。
+
+初回のコメント取得要求では、Data Collectorが要求直前のUTC日時を候補値として保持する。
+要求が正常終了した場合だけ`observationStartedAt`として採用し、
+Stream Metadata Lambdaが`collection_jobs.observationStartedAt`と
+`stream_metrics.analysisStartAt`を保存する。
+`analysisStartAt`は`streams.startedAt`と`observationStartedAt`の遅い方とする。
+取得コメントが0件の場合もこの保存処理を実行する。
 
 ---
 
@@ -832,6 +843,11 @@ Data Collectorの再実行時は、`data-model.md`の7.1節に従い同じ送信
 `collection_job_batches`にはSQS送信前に`batchId`、Outboxオブジェクトキーおよび
 Payload SHA-256を登録する。Stream Metadata Lambdaでの登録Commit後にだけSQS送信を開始する。
 
+`collection_jobs.observationStartedAt`には初回の正常なコメント取得要求の開始日時を保存し、
+`stream_metrics.analysisStartAt`には`streams.startedAt`と`observationStartedAt`の遅い方を設定する。
+タイムラインの0件区間補完と平均コメント速度の分母はこの時刻以降に限定し、
+`streams.startedAt`から`analysisStartAt`までの未観測期間は0件として扱わない。
+
 `nextPageToken`等のLambda間の継続処理状態については、
 Step Functionsの実行状態で管理するため、
 Auroraへの保存を収集継続の必須条件とはしない。
@@ -864,7 +880,7 @@ Aurora PostgreSQLではIAM DB認証を有効化する。
 
 | Lambda                    | DBユーザー               | DB権限                                                                                                                        |
 | ------------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
-| Stream Metadata Lambda    | `stream_metadata_user`   | `channels`、`streams`、`collection_jobs`、`collection_job_batches`への必要なSELECT / INSERT / UPDATE、およびSequenceのUSAGE |
+| Stream Metadata Lambda    | `stream_metadata_user`   | `channels`、`streams`、`stream_metrics`、`collection_jobs`、`collection_job_batches`への必要なSELECT / INSERT / UPDATE、およびSequenceのUSAGE |
 | Analyzer Lambda           | `analyzer_user`          | 分析結果・処理済み管理テーブルへの必要なSELECT / INSERT / UPDATE、およびSequenceのUSAGE                                    |
 | Analysis Finalizer Lambda | `analysis_finalizer_user` | 送信・処理済みバッチのSELECT、分析結果・`collection_jobs`への必要なSELECT / INSERT / UPDATE                               |
 | API Lambda                | `api_readonly_user`      | APIが参照するテーブルへのSELECTのみ                                                                                           |

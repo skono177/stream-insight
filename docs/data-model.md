@@ -187,19 +187,26 @@ YouTube Liveの配信を表す。
 - 総コメント数
 - 平均コメント文字数
 - 平均コメント速度（1分あたり）
+- 分析対象開始日時（`analysisStartAt`）
 - 分析基準日時（`analysisEndAt`）
 - その他の配信単位の指標
 
-平均コメント速度は、分析対象期間を`[streams.startedAt, analysisEndAt)`として、
+平均コメント速度は、分析対象期間を`[analysisStartAt, analysisEndAt)`として、
 以下の式で算出する。
 
 ```text
 averageCommentsPerMinute
-  = totalComments * 60 / (analysisEndAt - streams.startedAt の秒数)
+  = totalComments * 60 / (analysisEndAt - analysisStartAt の秒数)
 ```
 
 `totalComments`には同じ分析対象期間内のコメントだけを含める。
 期間が0秒の場合は`averageCommentsPerMinute`を`0`とする。
+
+`analysisStartAt`には、`streams.startedAt`と対象収集ジョブの`observationStartedAt`の
+遅い方を保存する。
+配信開始後に収集を開始した場合も`streams.startedAt`まで遡らず、
+観測を開始していない期間を分析対象へ含めない。
+同じ分析結果の再計算では保存済みの`analysisStartAt`を再利用し、変更しない。
 
 配信終了日時が確定し、終了までに取得したコメントの分析が完了した場合は、
 `analysisEndAt`を`streams.endedAt`に固定する。
@@ -236,12 +243,12 @@ averageCommentLength
 PoCの集計単位は1分に固定する。
 
 UTCの各正分を基準とする1分区間と、
-分析対象期間`[streams.startedAt, stream_metrics.analysisEndAt)`の共通部分を
+分析対象期間`[stream_metrics.analysisStartAt, stream_metrics.analysisEndAt)`の共通部分を
 各タイムライン区間とする。
 区間は開始日時を含み、終了日時を含まない半開区間`[startAt, endAt)`として扱う。
 境界と同じ投稿日時のコメントは、境界から始まる次の区間へ集計する。
 
-配信開始を含む最初の区間は`streams.startedAt`より前を除外し、
+観測開始を含む最初の区間は`analysisStartAt`より前を除外し、
 `analysisEndAt`直前までの最後の区間は`analysisEndAt`以降を除外する。
 このため、最初と最後の区間は60秒未満になる場合がある。
 
@@ -255,13 +262,14 @@ commentsPerMinute
   = commentCount * 60 / (endAt - startAt の秒数)
 ```
 
-同じ`streamId`、`startAt`、`endAt`、`analysisEndAt`を入力とした場合は、
+同じ`streamId`、`analysisStartAt`、`startAt`、`endAt`、`analysisEndAt`を入力とした場合は、
 増分分析とRaw Dataからの再分析で同じ区間およびコメント速度を生成する。
 
 例：
 
 ```text
-streams.startedAt = 15:00:20
+streams.startedAt = 14:58:00
+analysisStartAt   = 15:00:20
 analysisEndAt     = 15:02:10
 
 [15:00:20, 15:01:00) 40秒 → 80 comments → 120.0 comments/minute
@@ -386,6 +394,7 @@ YouTubeからのデータ収集処理を管理するための情報を表す。
 | --------------------- | --------------------------------------------------------------------------------- |
 | `executionArn`        | 収集ワークフローのExecution ARN。一意制約を設定し、再試行時も同じジョブを更新する |
 | `collectionStatus`    | RUNNING / COMPLETED / FAILED                                                      |
+| `observationStartedAt` | コメントの観測開始日時。初回の正常な取得要求の開始日時を一度だけ保存する          |
 | `collectionStoppedAt` | コメント収集を停止した時刻。終了処理への遷移時に一度だけ確定する                  |
 | `stopReason`          | 配信・Live Chat終了、API継続不能、Retry上限等の停止理由                           |
 | `errorCode`           | 最終メタデータ未取得等を含むエラー種別。レスポンス本文や認証情報は保存しない      |
@@ -393,6 +402,10 @@ YouTubeからのデータ収集処理を管理するための情報を表す。
 | `analysisFinalizedAt` | Analysis Finalizerが終了後の分析結果を確定した日時                                |
 
 開始時にRUNNINGで登録する。
+`observationStartedAt`は、Data Collectorが初回のコメント取得要求を送る直前に候補値を確定し、
+その要求が正常終了した場合に保存する。失敗した要求の開始日時は採用しない。
+初回レスポンスに`observationStartedAt`より前のコメントが含まれても分析対象には含めない。
+以降は同じ`nextPageToken`系列を欠落なく継続できた場合だけ収集成功とする。
 終了時は`streams`の最終メタデータ更新と同一トランザクションで終了状態を保存する。
 収集失敗がなく実終了日時の保存まで成功した場合だけ`collectionStatus`をCOMPLETEDとし、
 収集失敗・最終メタデータ未取得時はFAILEDとする。
@@ -593,6 +606,7 @@ Payload SHA-256はこのバイト列から算出し、`collection_job_batches`�
   "batchId": "batch-v1-4e6b8ac84f87fe828dfc6fa7c2bd2cbc4efd017322d650913bcae10bec864ad6",
   "streamId": "stream-001",
   "collectionJobId": "collection-job-001",
+  "analysisStartAt": "2026-08-23T15:00:20Z",
   "videoId": "youtube-video-id",
   "comments": [
     {
@@ -617,6 +631,10 @@ PoCで利用しないデータはSQSメッセージへ含めない。
 
 `batchId`はData Collector Lambdaで7.1節の規則により決定的に生成し、
 Analyzer Lambdaでは別のIDへ置き換えない。
+
+`analysisStartAt`には`streams.startedAt`と対象収集ジョブの`observationStartedAt`の遅い方を設定する。
+Analyzerは`publishedAt < analysisStartAt`のコメントをRaw Dataには保存するが、
+分析結果への加算および`processed_comments`への登録対象には含めない。
 
 SQS再配信に加え、送信結果不明時の再送信でも同じ送信内容には同じIDを使用する。
 全分割バッチをS3 Outboxへ保存し、`collection_job_batches`への登録をCommitしてからSQSへ送信する。
@@ -756,6 +774,10 @@ Data Collectorの再実行とStandard SQSの重複配信の両方を対象とす
 - 同じ送信内容：7.1節により同じ`batchId`を生成する
 - 異なるバッチに含まれる同じコメント：`(streamId, commentId)`で重複を排除する
 
+集計対象は`publishedAt >= stream_metrics.analysisStartAt`のコメントに限定する。
+観測開始前のコメントが初回APIレスポンスに含まれても、総数、文字数、タイムライン、
+文字数分布および頻出ワードへ加算しない。
+
 送信バッチは、S3 OutboxへのPayload保存、`collection_job_batches`への登録、
 登録済みPayloadのSQS送信の順に処理する。
 Auroraへの登録がCommitされる前にSQSへ送信しない。
@@ -796,12 +818,13 @@ Step Functionsへ待機が必要であることを返す。
 未処理バッチが0件で、`streams.endedAt`が保存済みの場合だけ、
 以下を一つのAuroraトランザクションで実行する。
 
-1. `streams.startedAt`から`streams.endedAt`までの不足している0件区間を`comment_timeline`へ作成する
+1. `stream_metrics.analysisStartAt`から`streams.endedAt`までの不足している0件区間を`comment_timeline`へ作成する
 2. 最初・最後の部分区間を含む各区間の`commentsPerMinute`を再計算する
 3. `stream_metrics.analysisEndAt`を`streams.endedAt`へ更新し、`averageCommentsPerMinute`を再計算する
 4. `collection_jobs.analysisStatus`をCOMPLETED、`analysisFinalizedAt`を確定処理時刻へ更新する
 
 確定処理は同じ収集ジョブに対して再実行可能な冪等処理とする。
+`analysisStartAt`より前の区間は作成・補完せず、コメントがなかった区間として扱わない。
 トランザクション失敗時はすべてRollbackし、`analysisStatus`をCOMPLETEDへ変更しない。
 DLQへの移動等で未処理バッチが残ったまま分析完了待ちがタイムアウトした場合、
 または確定処理の再試行上限到達時は、
