@@ -172,8 +172,26 @@ YouTube Liveの配信を表す。
 - Stream ID
 - 総コメント数
 - 平均コメント文字数
-- コメント速度
+- 平均コメント速度（1分あたり）
+- 分析基準日時（`analysisEndAt`）
 - その他の配信単位の指標
+
+平均コメント速度は、分析対象期間を`[streams.startedAt, analysisEndAt)`として、
+以下の式で算出する。
+
+```text
+averageCommentsPerMinute
+  = totalComments * 60 / (analysisEndAt - streams.startedAt の秒数)
+```
+
+`totalComments`には同じ分析対象期間内のコメントだけを含める。
+期間が0秒の場合は`averageCommentsPerMinute`を`0`とする。
+
+配信終了日時が確定し、終了までに取得したコメントの分析が完了した場合は、
+`analysisEndAt`を`streams.endedAt`に固定する。
+配信中は分析処理ごとに基準日時を一度だけ確定して保存し、
+同じ分析結果の全体指標とタイムラインで共通して使用する。
+同じRaw Dataを再分析する場合は、保存済みの`analysisEndAt`を入力として再利用する。
 
 ---
 
@@ -187,22 +205,44 @@ YouTube Liveの配信を表す。
 - 集計開始日時
 - 集計終了日時
 - コメント数
-- コメント速度
+- コメント速度（1分あたり）
 
-集計単位は実装時に決定する。
+PoCの集計単位は1分に固定する。
+
+UTCの各正分を基準とする1分区間と、
+分析対象期間`[streams.startedAt, stream_metrics.analysisEndAt)`の共通部分を
+各タイムライン区間とする。
+区間は開始日時を含み、終了日時を含まない半開区間`[startAt, endAt)`として扱う。
+境界と同じ投稿日時のコメントは、境界から始まる次の区間へ集計する。
+
+配信開始を含む最初の区間は`streams.startedAt`より前を除外し、
+`analysisEndAt`直前までの最後の区間は`analysisEndAt`以降を除外する。
+このため、最初と最後の区間は60秒未満になる場合がある。
+
+コメントが0件の区間も省略せず、`commentCount = 0`、
+`commentsPerMinute = 0`として保存・返却する。
+
+各区間のコメント速度は、部分区間を含めて以下の式で算出する。
+
+```text
+commentsPerMinute
+  = commentCount * 60 / (endAt - startAt の秒数)
+```
+
+同じ`streamId`、`startAt`、`endAt`、`analysisEndAt`を入力とした場合は、
+増分分析とRaw Dataからの再分析で同じ区間およびコメント速度を生成する。
 
 例：
 
 ```text
-Stream
-  ↓
-1分単位
-  ↓
-Comment Timeline
+streams.startedAt = 15:00:20
+analysisEndAt     = 15:02:10
 
-15:00 - 15:01 → 120 comments
-15:01 - 15:02 → 185 comments
-15:02 - 15:03 → 210 comments
+[15:00:20, 15:01:00) 40秒 → 80 comments → 120.0 comments/minute
+[15:01:00, 15:02:00) 60秒 →  0 comments →   0.0 comments/minute
+[15:02:00, 15:02:10) 10秒 → 10 comments →  60.0 comments/minute
+
+averageCommentsPerMinute = 90 * 60 / 110 = 49.1
 ```
 
 ---
