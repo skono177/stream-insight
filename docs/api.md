@@ -336,6 +336,8 @@ Unicode 15.1.0のUnicode Standard Annex #29で定義される
 
 `analysisStatus`はPENDING / FINALIZING / COMPLETED / FAILEDのいずれかを返す。
 終了後の確定値として扱えるのはCOMPLETEDの場合だけとする。
+収集処理が失敗した場合はFAILEDを返し、収集済み範囲の値が残っていても未確定値として扱う。
+FAILEDの場合は未観測区間を0件として補完せず、`analysisEndAt`を`endedAt`へ固定しない。
 
 ---
 
@@ -395,6 +397,7 @@ GET /api/streams/{streamId}/timeline
 `commentCount * 60 / (endAt - startAtの秒数)`で1分あたりに換算する。
 全体平均およびタイムラインは同じ`analysisStartAt`と`analysisEndAt`を使用する。
 `analysisStatus`がCOMPLETEDになるまではタイムラインを暫定値として扱う。
+FAILEDの場合は収集済み範囲の部分的なタイムラインであり、確定済み結果として扱わない。
 COMPLETEDの場合は、送信済みバッチの分析完了確認と
 `analysisStartAt`から終了時刻までの0件区間補完が完了しており、
 `analysisEndAt`は`endedAt`と一致する。

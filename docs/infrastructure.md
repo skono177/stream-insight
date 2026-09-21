@@ -372,6 +372,7 @@ Data Collectorを送信モードで呼び出す。
 - `streams`の作成・更新
 - 終了時の最終メタデータ（`endedAt`を含む）更新
 - Execution ARNを一意キーとする`collection_jobs`の開始登録・終了状態更新
+- 収集成功時の`analysisStatus=FINALIZING`、収集失敗時の`analysisStatus=FAILED`への更新
 - `collection_jobs.observationStartedAt`および`stream_metrics.analysisStartAt`の初回保存
 - SQS送信前の`batchId`、Outboxオブジェクトキー、Payload SHA-256の`collection_job_batches`への冪等登録
 - 内部`channelId`の採番・取得
@@ -461,6 +462,7 @@ Auroraへの接続が必要となるためVPC内へ配置する。
 役割：
 
 - `collection_job_batches`と`processed_comment_batches`の突合
+- `collection_jobs.collectionStatus=COMPLETED`の前提条件確認
 - 未処理バッチが残る場合のPENDING返却
 - `stream_metrics.analysisStartAt`から終了時刻までのコメント0件区間の補完
 - コメント速度および全体平均の再計算
@@ -474,8 +476,13 @@ stream-insight-analysis-finalizer
 ```
 
 Step Functionsから配信終了後に呼び出す。
-未処理バッチが0件で`streams.endedAt`が保存済みの場合だけ、
+`collectionStatus=COMPLETED`、未処理バッチが0件、かつ`streams.endedAt`が保存済みの場合だけ、
 分析結果と分析状態を一つのAuroraトランザクションで冪等に確定する。
+
+`collectionStatus`がFAILEDまたはRUNNINGの場合は、0件区間の補完、
+`analysisEndAt`の更新および`analysisStatus=COMPLETED`への更新を行わない。
+収集失敗時はStream Metadata Lambdaが`analysisStatus=FAILED`を保存し、
+Step FunctionsはAnalysis Finalizerを呼び出さずExecutionを失敗させる。
 
 Auroraへ接続するためVPC内へ配置し、Reserved Concurrencyは1とする。
 1実行につき物理接続を最大1本とし、実行終了前に閉じる。
@@ -576,11 +583,15 @@ Live Chat終了？
   │     ↓
   │    Persist Final Metadata / Collection Status (Stream Metadata Lambda)
   │     ↓
-  │    Finalize Analysis (Analysis Finalizer Lambda)
-  │     ↓
-  │    未処理バッチあり？
-  │      ├── Yes → Wait 10秒 → Finalize Analysis
-  │      └── No  → analysisStatus=COMPLETED → End
+  │    collectionStatus?
+  │      ├── FAILED → analysisStatus=FAILED → Fail
+  │      └── COMPLETED
+  │           ↓
+  │          Finalize Analysis (Analysis Finalizer Lambda)
+  │           ↓
+  │          未処理バッチあり？
+  │            ├── Yes → Wait 10秒 → Finalize Analysis
+  │            └── No  → analysisStatus=COMPLETED → End
   │
   └── No
         ↓
@@ -639,7 +650,8 @@ Outbox登録後のSQS送信が失敗した場合、または送信成功応答�
 送信処理のRetryではYouTube Data APIを再取得しない。
 
 収集TaskのRetry上限到達時はCatchで終了処理へ進み、
-収集失敗状態を保存してからState Machine Executionを失敗として終了させる。
+`collectionStatus=FAILED`と`analysisStatus=FAILED`を保存し、
+Analysis Finalizerを呼び出さずState Machine Executionを失敗として終了させる。
 
 終了時の最終メタデータ取得は初回を含め最大5回、30秒間隔のWaitで再試行する。
 DB保存は初回を含め最大4回、2秒・4秒・8秒のBackoffで再試行する。
@@ -1085,6 +1097,38 @@ Bucket自体はPublicにしない。
 
 CloudFront経由のみでアクセスできる構成とする。
 
+Frontend S3ではBlock Public Accessをすべて有効にし、ACLによる公開を許可しない。
+CloudFrontからはS3 Website EndpointではなくS3 REST Originを使用し、
+Origin Access Control（OAC）による署名付きリクエストだけを受け付ける。
+
+Bucket PolicyではCloudFrontサービスプリンシパルに`GetObject`だけを許可し、
+`AWS:SourceArn`をこのFrontend用CloudFront DistributionのARNに限定する。
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCloudFrontDistributionRead",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "cloudfront.amazonaws.com"
+      },
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::stream-insight-web-<account-id>/*",
+      "Condition": {
+        "StringEquals": {
+          "AWS:SourceArn": "arn:aws:cloudfront::<account-id>:distribution/<distribution-id>"
+        }
+      }
+    }
+  ]
+}
+```
+
+Frontend Bucketへの匿名アクセス、他のCloudFront Distributionからのアクセス、
+およびCloudFrontを経由しないオブジェクト取得は許可しない。
+
 ---
 
 ### 12.2. CloudFront
@@ -1112,7 +1156,20 @@ APIレスポンスについては、
 PoCでは分析結果の更新を速やかに反映できるよう、
 原則としてCloudFrontキャッシュを無効化する。
 
-### 12.2.1. APIパス変換とOrigin設定
+### 12.2.1. Frontend S3 Origin Access Control
+
+Frontend S3 OriginにはCloudFront OACを関連付け、以下を設定する。
+
+| 設定項目 | 値 |
+| --- | --- |
+| Origin Type | `s3` |
+| Signing Behavior | `always` |
+| Signing Protocol | `sigv4` |
+
+OACはDefault BehaviorのFrontend S3 Originだけに関連付ける。
+API Gateway Originには関連付けない。
+
+### 12.2.2. APIパス変換とOrigin設定
 
 CloudFrontのCache BehaviorはURIを書き換えないため、
 `/api/*` Cache Behaviorのviewer-requestイベントに
@@ -1170,6 +1227,9 @@ LIVEステージのFunctionをBehaviorに関連付ける。
 CloudFront経由で既存のAPIリソースへ到達できること、
 `limit`・`offset`が維持されること、
 Frontend静的ファイルの配信が維持されることを確認する。
+あわせて、CloudFront経由のFrontendオブジェクト取得が成功すること、
+S3の直接URLによる匿名取得が403となること、Bucket Policyの`AWS:SourceArn`が
+作成したDistribution ARNだけに一致することを確認する。
 
 ---
 
@@ -1368,6 +1428,7 @@ PoCではCloudWatch Logsの保持期間を以下とする。
 | Analyzer Lambda              |      7日 | 削除           |
 | Analysis Finalizer Lambda    |      7日 | 削除           |
 | API Lambda                   |      7日 | 削除           |
+| Migration Lambda             |      7日 | 削除           |
 | API Gateway Access Log       |      7日 | 削除           |
 | Step Functions Execution Log |      7日 | 削除           |
 
@@ -1381,6 +1442,10 @@ Removal Policy: DESTROY
 Lambdaのロググループについても、
 Lambdaによる暗黙的な無期限保持に依存せず、
 CDK管理下で保持期間を明示する。
+
+Migration Lambdaの`/aws/lambda/<migration-function-name>` Log GroupもCDKで明示的に作成し、
+Custom Resourceが同Lambdaを初めて呼び出す前に作成される依存関係を設定する。
+保持期間は7日、Removal PolicyはDESTROYとする。
 
 PoCの`dev`環境では、
 CloudFormation Stack削除時に対象Log Groupも削除する。
@@ -1588,6 +1653,8 @@ API LambdaにはReserved Concurrencyを設定する。
 - Frontend S3
 - CloudFront
 - Frontend S3 Origin
+- Frontend S3 Origin用CloudFront OAC
+- Distribution ARNに限定したFrontend S3 Bucket Policy
 - API Gateway Origin
 - `/api/*` Cache Behavior
 - APIパス変換用CloudFront Function（公開およびviewer-requestへの関連付け）

@@ -205,11 +205,15 @@ nextPageToken取得
   │   ↓
   │  Persist Final Metadata / Collection Status (Stream Metadata Lambda)
   │   ↓
-  │  Finalize Analysis (Analysis Finalizer Lambda)
-  │   ↓
-  │  未処理バッチあり？
-  │    ├─ Yes → Wait 10秒 → Finalize Analysis
-  │    └─ No  → analysisStatus=COMPLETED → End
+  │  collectionStatus?
+  │    ├─ FAILED → analysisStatus=FAILED → Fail
+  │    └─ COMPLETED
+  │         ↓
+  │        Finalize Analysis (Analysis Finalizer Lambda)
+  │         ↓
+  │        未処理バッチあり？
+  │          ├─ Yes → Wait 10秒 → Finalize Analysis
+  │          └─ No  → analysisStatus=COMPLETED → End
   │
   └─ No
       ↓
@@ -228,7 +232,9 @@ Wait時間はYouTube Data APIから取得できるポーリング間隔を考慮
 最終メタデータ、収集状態および確定済み分析状態の保存成功後にワークフローを正常終了する。
 
 収集TaskのRetry上限到達等はCatchから終了処理へ進み、
-収集失敗を記録してから異常終了する。保存自体の失敗も通知対象とする。
+`collectionStatus=FAILED`および`analysisStatus=FAILED`を記録してから異常終了する。
+収集失敗時はAnalysis Finalizerを呼び出さず、0件区間を補完しない。
+保存自体の失敗も通知対象とする。
 
 ---
 
@@ -536,6 +542,10 @@ Aurora PostgreSQLから分析結果を取得してレスポンスを返す。
 配信終了後、SQS送信前に登録したコメントバッチがすべて分析済みであることを確認し、
 配信全体の分析結果を確定する。
 
+Analysis Finalizerは`collection_jobs.collectionStatus=COMPLETED`の場合だけ確定処理を行う。
+`collectionStatus`がFAILEDまたはRUNNINGの場合は、タイムラインの補完、
+`analysisEndAt`の更新および`analysisStatus=COMPLETED`への更新を行わずFAILEDを返す。
+
 主な責務：
 
 - `collection_job_batches`と`processed_comment_batches`の突合
@@ -710,7 +720,9 @@ Analysis Finalizer Lambda
 ```
 
 Step Functionsは`streams.endedAt`および収集終了状態の保存後、
-Analysis Finalizer Lambdaを呼び出す。
+`collectionStatus=COMPLETED`の場合だけAnalysis Finalizer Lambdaを呼び出す。
+`collectionStatus=FAILED`の場合は同じトランザクションで`analysisStatus=FAILED`を保存し、
+Finalizerを呼び出さずState Machine Executionを失敗させる。
 
 Analysis Finalizerは、SQS送信前に対象`collectionJobId`の`collection_job_batches`へ登録された全`batchId`が
 `processed_comment_batches`へ登録済みかを確認する。
@@ -814,9 +826,10 @@ PoC完了後、EventBridge等を利用した自動化を検討する。
 1. 取得済みコメントの全分割バッチについて、SQS送信前の`collection_job_batches`への登録と、その登録済みPayloadのSQS送信成功を確認する。失敗時は正常終了扱いにしない
 2. Step Functionsで`collectionStoppedAt`を一度だけ確定し、Execution ARN、内部`streamId`、`videoId`、停止理由とともに保持する
 3. Data Collectorを最終メタデータ取得モードで呼び出し、`videos.list(part=snippet,liveStreamingDetails, id=videoId)`からタイトル、実開始日時、実終了日時を再取得する。このモードではコメントを再送信しない
-4. Stream Metadata Lambdaへ必要項目を渡し、`streams`の最終メタデータ、対象`collection_jobs`の終了状態および`analysisStatus=FINALIZING`を同一トランザクションで保存する
-5. Analysis Finalizer Lambdaで送信済みバッチの分析完了を確認する。未処理の場合は10秒待機して再確認する
-6. 未処理バッチが0件になったら、`analysisStartAt`から終了時刻までの分析結果と`analysisEndAt`を確定し、`analysisStatus=COMPLETED`の保存成功後にのみ正常終了する
+4. Stream Metadata Lambdaへ必要項目を渡し、`streams`の最終メタデータと対象`collection_jobs`の終了状態を同一トランザクションで保存する。欠落のない収集と実終了日時の保存に成功した場合だけ`collectionStatus=COMPLETED`、`analysisStatus=FINALIZING`とし、それ以外は両方をFAILEDとする
+5. `collectionStatus=FAILED`の場合はFinalizerを呼び出さずFailへ遷移する
+6. `collectionStatus=COMPLETED`の場合だけAnalysis Finalizer Lambdaで送信済みバッチの分析完了を確認する。未処理の場合は10秒待機して再確認する
+7. 未処理バッチが0件になったら、`analysisStartAt`から終了時刻までの分析結果と`analysisEndAt`を確定し、`analysisStatus=COMPLETED`の保存成功後にのみ正常終了する
 
 `streams.endedAt`には`liveStreamingDetails.actualEndTime`をUTCで保存する。
 収集停止時刻、現在時刻、予定終了時刻を代用しない。
@@ -829,12 +842,14 @@ Step FunctionsのWaitで30秒間隔、初回を含め最大5回まで再取得�
 
 上限到達・継続不能時は取得できた項目だけを保存し、
 未取得の`endedAt`はNULLのまま（既存値がある場合は保持）とする。
-`collection_jobs.collectionStatus=FAILED`、停止理由・エラー種別を保存し、Failへ遷移する。
+`collection_jobs.collectionStatus=FAILED`、`analysisStatus=FAILED`、停止理由・エラー種別を保存し、
+Analysis Finalizerを呼び出さずFailへ遷移する。
 配信継続中にLive Chatだけが閉じた場合も、終了日時を捏造せずこの経路で扱う。
 
 収集中のエラーで停止した場合もCatchから同じ終了処理へ進める。
 実終了日時を取得できても、収集失敗があった実行をCOMPLETEDに変更しない。
 収集失敗がなく、実終了日時と終了状態を保存できた場合のみ`collectionStatus=COMPLETED`とする。
+`observationStartedAt`以降の`nextPageToken`系列に欠落がないこともCOMPLETEDの必須条件とする。
 `collectionStatus=COMPLETED`は収集完了、`analysisStatus=COMPLETED`はSQS消化後の分析確定を表す。
 State Machine Executionは両方がCOMPLETEDになった場合だけ正常終了する。
 

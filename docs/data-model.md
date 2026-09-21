@@ -410,8 +410,12 @@ YouTubeからのデータ収集処理を管理するための情報を表す。
 収集失敗がなく実終了日時の保存まで成功した場合だけ`collectionStatus`をCOMPLETEDとし、
 収集失敗・最終メタデータ未取得時はFAILEDとする。
 
-`analysisStatus`は開始時にPENDINGとし、終了メタデータ保存後にFINALIZINGへ更新する。
+`analysisStatus`は開始時にPENDINGとする。
+`collectionStatus=COMPLETED`となった場合だけFINALIZINGへ更新し、
 送信済みバッチの分析完了後、終了時刻までの分析結果を確定できた場合だけCOMPLETEDとする。
+収集失敗、`nextPageToken`系列の欠落、最終メタデータ未取得等で
+`collectionStatus=FAILED`となる場合は、同じトランザクションで`analysisStatus=FAILED`へ更新する。
+この場合はAnalysis Finalizerによる0件区間の補完および分析結果の確定を行わない。
 DLQへの移動等で未処理バッチが残ったまま分析完了待ちがタイムアウトした場合、
 または確定処理が失敗した場合はFAILEDとする。
 `collectionStatus=COMPLETED`だけではSQSの消化やAnalyzerの分析完了を保証せず、
@@ -813,9 +817,14 @@ Aurora Commit前後の失敗で集計値が二重加算されないことを検�
 終了メタデータ保存後、Analysis Finalizerは対象収集ジョブについて、
 `collection_job_batches`に存在し、`processed_comment_batches`に存在しない`batchId`の件数を確認する。
 
+ただし、確定処理の前提条件は`collection_jobs.collectionStatus=COMPLETED`である。
+FAILEDまたはRUNNINGの場合は未処理バッチ数にかかわらず確定処理を開始せず、
+0件区間、`stream_metrics.analysisEndAt`および確定済み分析結果を更新しない。
+`collectionStatus=FAILED`の場合は`analysisStatus=FAILED`を保持する。
+
 未処理バッチが1件以上ある場合は分析結果を確定せず、
 Step Functionsへ待機が必要であることを返す。
-未処理バッチが0件で、`streams.endedAt`が保存済みの場合だけ、
+`collectionStatus=COMPLETED`、未処理バッチが0件、かつ`streams.endedAt`が保存済みの場合だけ、
 以下を一つのAuroraトランザクションで実行する。
 
 1. `stream_metrics.analysisStartAt`から`streams.endedAt`までの不足している0件区間を`comment_timeline`へ作成する
