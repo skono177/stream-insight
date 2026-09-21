@@ -21,41 +21,56 @@ AWSリソースはAWS CDKで管理する。
 
 PoCでは以下のAWSサービスを利用する。
 
-| 用途               | AWSサービス                            |
-| ------------------ | -------------------------------------- |
-| フロントエンド配信 | Amazon S3                              |
-| CDN                | Amazon CloudFront                      |
-| REST API           | Amazon API Gateway                     |
-| API処理            | AWS Lambda                             |
-| データ収集         | AWS Lambda                             |
-| 配信メタデータ保存 | AWS Lambda                             |
-| コメント収集制御   | AWS Step Functions                     |
-| コメント分析       | AWS Lambda                             |
-| 非同期処理         | Amazon SQS                             |
-| Raw Data保存       | Amazon S3                              |
-| 分析結果保存       | Amazon Aurora Serverless v2 PostgreSQL |
-| API Key管理        | AWS Systems Manager Parameter Store    |
-| OAuth認証情報管理  | AWS Secrets Manager                    |
-| ログ・監視         | Amazon CloudWatch                      |
-| IaC                | AWS CDK                                |
+| 用途                  | AWSサービス                            |
+| --------------------- | -------------------------------------- |
+| フロントエンド配信    | Amazon S3                              |
+| CDN / APIルーティング | Amazon CloudFront                      |
+| REST API              | Amazon API Gateway                     |
+| API処理               | AWS Lambda                             |
+| データ収集            | AWS Lambda                             |
+| 配信メタデータ保存    | AWS Lambda                             |
+| コメント収集制御      | AWS Step Functions                     |
+| コメント分析          | AWS Lambda                             |
+| 非同期処理            | Amazon SQS                             |
+| Raw Data保存          | Amazon S3                              |
+| 分析結果保存          | Amazon Aurora Serverless v2 PostgreSQL |
+| API Key管理           | AWS Systems Manager Parameter Store    |
+| OAuth認証情報管理     | AWS Secrets Manager                    |
+| ログ・監視            | Amazon CloudWatch                      |
+| IaC                   | AWS CDK                                |
 
 ---
 
 ## 3. 全体構成
 
 ```text
-                           Internet
+                            Browser
                                │
+                               │ Same Origin
                                ▼
                       ┌─────────────────┐
                       │   CloudFront    │
-                      └────────┬────────┘
-                               │
-                               ▼
-                      ┌─────────────────┐
-                      │ S3 Frontend     │
-                      │   Next.js       │
-                      └─────────────────┘
+                      └───────┬─────────┘
+                              │
+                ┌─────────────┴─────────────┐
+                │                           │
+          Default Behavior              /api/*
+                │                           │
+                ▼                           ▼
+       ┌─────────────────┐        ┌─────────────────┐
+       │ S3 Frontend     │        │   API Gateway   │
+       │   Next.js       │        └────────┬────────┘
+       └─────────────────┘                 │
+                                           ▼
+                                  ┌─────────────────┐
+                                  │   API Lambda    │
+                                  └────────┬────────┘
+                                           │
+                                           ▼
+                                  ┌────────────────────┐
+                                  │ Aurora Serverless  │
+                                  │ PostgreSQL         │
+                                  └────────────────────┘
 
 
                       ┌─────────────────┐
@@ -74,19 +89,21 @@ PoCでは以下のAWSサービスを利用する。
                       ┌─────────────────┐
                       │ YouTube Data API│
                       └─────────────────┘
-                              │
-                              │ Stream Metadata
-                              ▼
-                      ┌─────────────────┐
-                      │ Stream Metadata │
-                      │ Lambda          │
-                      └───────┬─────────┘
-                              │
-                              ▼
-                      ┌────────────────────┐
-                      │ Aurora Serverless  │
-                      │ PostgreSQL         │
-                      └────────────────────┘
+
+Step Functions
+      │
+      │ Stream Metadata
+      ▼
+┌─────────────────┐
+│ Stream Metadata │
+│ Lambda          │
+└────────┬────────┘
+         │
+         ▼
+┌────────────────────┐
+│ Aurora Serverless  │
+│ PostgreSQL         │
+└────────────────────┘
 
 Data Collector Lambda
          │
@@ -107,18 +124,25 @@ Data Collector Lambda
 ┌──────────────────┐ ┌────────────────────┐
 │ S3 Gateway       │ │ Aurora Serverless  │
 │ VPC Endpoint     │ │ PostgreSQL         │
-└────────┬─────────┘ └─────────▲──────────┘
-         │                      │
-         ▼               ┌──────┴──────┐
-┌──────────────────┐     │ API Lambda  │
-│ S3 Raw Data      │     └──────▲──────┘
-└──────────────────┘            │
-                         ┌──────┴──────┐
-                         │ API Gateway │
-                         └──────▲──────┘
-                                │
-                             Next.js
+└────────┬─────────┘ └────────────────────┘
+         │
+         ▼
+┌──────────────────┐
+│ S3 Raw Data      │
+└──────────────────┘
 ```
+
+CloudFrontには以下の2つのOriginを設定する。
+
+```text
+Frontend S3
+API Gateway
+```
+
+Default BehaviorではFrontend S3へルーティングし、
+`/api/*`へのリクエストはAPI Gatewayへルーティングする。
+
+これによりブラウザからFrontendとAPIを同一オリジンとして利用する。
 
 Step Functionsは収集開始時に配信メタデータを永続化した後、
 Data Collector Lambdaを繰り返し呼び出し、
@@ -683,6 +707,27 @@ GET /streams/{streamId}/length-distribution
 GET /streams/{streamId}/frequent-words
 ```
 
+API GatewayはCloudFrontのAPI Originとして設定する。
+
+CloudFrontでは`/api/*`をAPI Gatewayへルーティングする。
+
+ブラウザからはCloudFront経由で以下の形式でAPIへアクセスする。
+
+```text
+/api/streams
+/api/streams/{streamId}
+/api/streams/{streamId}/metrics
+/api/streams/{streamId}/timeline
+/api/streams/{streamId}/length-distribution
+/api/streams/{streamId}/frequent-words
+```
+
+CloudFrontからAPI Gatewayへ転送する際は、
+`/api`プレフィックスを除去してAPI Gateway側の既存パスへ転送する。
+
+これによりFrontendとAPIを同一オリジンとして提供し、
+PoCではブラウザからのAPIアクセスのためのCORS設定を不要とする。
+
 詳細は`api.md`に定義する。
 
 PoCでは外部ユーザー向けAPIとしての公開は行わない。
@@ -702,6 +747,16 @@ Static Export
 S3
    ↓
 CloudFront
+```
+
+ブラウザからAPIへアクセスする場合も同じCloudFront Distributionを利用する。
+
+```text
+Browser
+   ↓
+CloudFront
+   ├── /*       → Frontend S3
+   └── /api/*   → API Gateway
 ```
 
 ---
@@ -724,14 +779,37 @@ CloudFront経由のみでアクセスできる構成とする。
 
 ### 12.2. CloudFront
 
-CloudFrontからFrontend S3へアクセスする。
+CloudFrontには以下の2つのOriginを設定する。
+
+```text
+Frontend S3
+API Gateway
+```
+
+Cache Behaviorは以下を基本とする。
+
+| Path Pattern  | Origin      | 用途                  |
+| ------------- | ----------- | --------------------- |
+| Default (`*`) | Frontend S3 | Next.js静的コンテンツ |
+| `/api/*`      | API Gateway | REST API              |
+
+`/api/*`についてはGETリクエストをAPI Gatewayへ転送する。
+
+PoCのAPIはRead Onlyであるため、
+API用Behaviorで許可するHTTPメソッドはGETおよび必要なHEADに限定する。
+
+APIレスポンスについては、
+PoCでは分析結果の更新を速やかに反映できるよう、
+原則としてCloudFrontキャッシュを無効化する。
 
 用途：
 
 - HTTPS
 - CDN
-- キャッシュ
+- フロントエンド配信
+- APIルーティング
 - S3の直接公開防止
+- FrontendとAPIの同一オリジン化
 
 ---
 
@@ -971,6 +1049,9 @@ Partial Batch Responseを有効化する。
 
 - Frontend S3
 - CloudFront
+- Frontend S3 Origin
+- API Gateway Origin
+- `/api/*` Cache Behavior
 
 ---
 

@@ -8,6 +8,12 @@ PoCでは、Web UIから配信情報およびコメント分析結果を取得�
 
 APIはAmazon API GatewayおよびAWS Lambdaを利用して実装する。
 
+ブラウザからAPIへアクセスする際は、
+Frontendと同じCloudFront Distributionを利用し、
+`/api/*`をAPI Gatewayへルーティングする。
+
+これによりFrontendとAPIを同一オリジンとして提供する。
+
 ---
 
 ## 2. API方針
@@ -30,13 +36,43 @@ PoCでは外部ユーザー向けのAPI公開は行わない。
 
 将来的に認証・認可、API利用量制限、課金等を実装したうえで外部公開を検討する。
 
+### 2.5. ブラウザからのAPIアクセス
+
+FrontendとAPIは同一のCloudFront Distributionから提供する。
+
+```text
+Browser
+   ↓
+CloudFront
+   ├── /*       → Frontend S3
+   └── /api/*   → API Gateway
+```
+
+ブラウザからは以下のような相対パスでAPIへアクセスする。
+
+```text
+/api/streams
+/api/streams/{streamId}
+/api/streams/{streamId}/metrics
+```
+
+FrontendとAPIが同一オリジンとなるため、
+PoCではブラウザからのAPIアクセスのためのCORS設定を不要とする。
+
+将来的にAPIを別オリジンから直接利用させる場合は、
+許可するOrigin、HTTP Method、Headerを明示したCORS設定を追加する。
+
 ---
 
 ## 3. API構成
 
 ```text
-Next.js
+Browser
    ↓
+CloudFront
+   │
+   │ /api/*
+   ▼
 API Gateway
    ↓
 API Lambda
@@ -44,9 +80,28 @@ API Lambda
 Aurora PostgreSQL
 ```
 
+CloudFrontはブラウザ向けの`/api`プレフィックスを除去して、
+API Gateway側のREST APIへリクエストを転送する。
+
+例えば、
+
+```text
+Browser:
+GET /api/streams
+
+↓
+
+API Gateway:
+GET /streams
+```
+
+として扱う。
+
 ---
 
 # 4. エンドポイント一覧
+
+API Gateway内部では以下のエンドポイントを定義する。
 
 | Method | Endpoint                                  | 概要                     |
 | ------ | ----------------------------------------- | ------------------------ |
@@ -57,6 +112,17 @@ Aurora PostgreSQL
 | GET    | `/streams/{streamId}/length-distribution` | コメント文字数分布を取得 |
 | GET    | `/streams/{streamId}/frequent-words`      | 頻出ワードを取得         |
 
+ブラウザからアクセスする場合は、
+各エンドポイントの先頭に`/api`を付与する。
+
+例：
+
+```text
+GET /api/streams
+GET /api/streams/{streamId}
+GET /api/streams/{streamId}/metrics
+```
+
 ---
 
 # 5. API仕様
@@ -65,8 +131,16 @@ Aurora PostgreSQL
 
 ### Endpoint
 
+API Gateway：
+
 ```http
 GET /streams
+```
+
+ブラウザ：
+
+```http
+GET /api/streams
 ```
 
 ### 概要
@@ -106,8 +180,16 @@ PoCではページングの詳細仕様は実装時に決定する。
 
 ### Endpoint
 
+API Gateway：
+
 ```http
 GET /streams/{streamId}
+```
+
+ブラウザ：
+
+```http
+GET /api/streams/{streamId}
 ```
 
 ### 概要
@@ -140,8 +222,16 @@ GET /streams/{streamId}
 
 ### Endpoint
 
+API Gateway：
+
 ```http
 GET /streams/{streamId}/metrics
+```
+
+ブラウザ：
+
+```http
+GET /api/streams/{streamId}/metrics
 ```
 
 ### 概要
@@ -172,8 +262,16 @@ GET /streams/{streamId}/metrics
 
 ### Endpoint
 
+API Gateway：
+
 ```http
 GET /streams/{streamId}/timeline
+```
+
+ブラウザ：
+
+```http
+GET /api/streams/{streamId}/timeline
 ```
 
 ### 概要
@@ -209,8 +307,16 @@ GET /streams/{streamId}/timeline
 
 ### Endpoint
 
+API Gateway：
+
 ```http
 GET /streams/{streamId}/length-distribution
+```
+
+ブラウザ：
+
+```http
+GET /api/streams/{streamId}/length-distribution
 ```
 
 ### 概要
@@ -253,8 +359,16 @@ GET /streams/{streamId}/length-distribution
 
 ### Endpoint
 
+API Gateway：
+
 ```http
 GET /streams/{streamId}/frequent-words
+```
+
+ブラウザ：
+
+```http
+GET /api/streams/{streamId}/frequent-words
 ```
 
 ### 概要
@@ -381,6 +495,9 @@ YouTube API上のIDとは分離して管理する。
 | `GET /streams/{streamId}/timeline`            | `comment_timeline`            |
 | `GET /streams/{streamId}/length-distribution` | `comment_length_distribution` |
 | `GET /streams/{streamId}/frequent-words`      | `frequent_words`              |
+
+CloudFront経由でブラウザからアクセスする場合は、
+上記パスの先頭に`/api`を付与する。
 
 ---
 
