@@ -273,7 +273,7 @@ YouTubeからのデータ収集処理を管理するための情報を表す。
 
 ### 4.8. Processed Comment Batch
 
-SQSメッセージの重複配信による分析結果の二重更新を防止するため、
+Data Collectorの再実行およびSQSメッセージの重複配信による分析結果の二重更新を防止するため、
 処理済みのコメントバッチを管理する。
 
 主な情報：
@@ -294,6 +294,25 @@ Analyzer Lambdaは分析結果を更新する際、
 
 ---
 
+### 4.9. Processed Comment
+
+再取得時にコメントバッチの構成が変わった場合も二重集計を防ぐため、
+`processed_comments`で処理済みコメントを管理する。
+
+保存項目：
+
+- `streamId`：内部Stream ID
+- `commentId`：YouTubeのコメントID（投稿者IDではない）
+- `processedAt`：処理日時
+
+`(streamId, commentId)`を複合主キーとする。
+本文、投稿者ID、プロフィール等は保存しない。
+
+コメントID登録、バッチ登録、分析結果更新を同一Auroraトランザクションで確定する。
+登録できた新規コメントだけを集計する。
+
+---
+
 ## 5. エンティティ間の関係
 
 ```text
@@ -311,7 +330,9 @@ Channel
            │
            ├──< Collection Job
            │
-           └──< Processed Comment Batch
+           ├──< Processed Comment Batch
+           │
+           └──< Processed Comment
 ```
 
 コメント原データについてはAuroraには保存せず、S3上のRaw Dataとして管理する。
@@ -370,8 +391,9 @@ Aurora PostgreSQL
 Analyzer Lambdaはコメントデータを分析し、
 Web UIおよびAPIから利用する分析結果をAurora PostgreSQLへ保存する。
 
-分析結果の更新と`processed_comment_batches`への`batchId`登録は
-同一のAuroraトランザクションで実行する。
+分析結果の更新、`processed_comment_batches`への`batchId`登録、
+`processed_comments`へのコメントID登録は同一のAuroraトランザクションで実行する。
+集計対象は新規登録できたコメントのみとする。
 
 ---
 
@@ -387,7 +409,7 @@ PoCでは、複数のコメントを1メッセージにまとめる方式を基�
 
 ```json
 {
-  "batchId": "550e8400-e29b-41d4-a716-446655440000",
+  "batchId": "batch-v1-4e6b8ac84f87fe828dfc6fa7c2bd2cbc4efd017322d650913bcae10bec864ad6",
   "streamId": "stream-001",
   "videoId": "youtube-video-id",
   "comments": [
@@ -411,14 +433,43 @@ PoCではSQSメッセージについても、
 メンバーシップ情報、Super Chat情報、投稿者情報等の
 PoCで利用しないデータはSQSメッセージへ含めない。
 
-`batchId`はData Collector Lambdaでコメントバッチを生成する際に一度だけ生成し、
-Analyzer Lambdaでは再生成しない。
+`batchId`はData Collector Lambdaで7.1節の規則により決定的に生成し、
+Analyzer Lambdaでは別のIDへ置き換えない。
 
-SQSの再配信時にも同じ`batchId`を利用することで、
-Analyzer Lambdaが処理済みメッセージを判定できるようにする。
+SQS再配信に加え、Data Collectorの再実行でも同じ送信内容には同じIDを使用する。
+SQSの送信成功を全分割バッチで確認してから次ページトークンを返却する。
+一部の送信失敗・結果不明時は取得位置を進めず再試行する。
 
-SQSのメッセージサイズやコメント量に応じて、
-1メッセージあたりのコメント数は実装時に調整する。
+### 7.1. batchId生成仕様
+
+`batchId`は`batch-v1-`とSHA-256の小文字16進数64桁を連結した文字列とする。
+ランダムUUID、Lambda Request ID、実行時刻、Retry回数は生成材料に含めない。
+
+Data Collectorは以下の手順で各送信バッチを生成する。
+
+1. PoCで保存を許可した項目だけを抽出する
+2. 同一取得結果内の`commentId`重複を除き、IDのUTF-8バイト列の昇順で並べる。同じIDで本文・投稿日時が異なる場合は任意に選択せずエラーとする
+3. SQSメッセージのUTF-8サイズ上限内に収まるよう、固定の分割規則で先頭から分割する。上限値・規則はバージョン管理し、再試行中は変更しない
+4. 各分割バッチについて、以下の固定順序の配列をJSON化し、そのUTF-8バイト列のSHA-256を算出する
+
+```text
+["batch-v1", streamId, videoId,
+  [[commentId, text, publishedAt], ...]]
+```
+
+JSON化はPythonの`json.dumps(value, ensure_ascii=False, separators=(",", ":"))`とし、
+BOM・末尾改行を付けない。`publishedAt`はUTC・小数秒6桁・末尾`Z`の形式へ統一する。
+コメントIDと本文にはUnicode正規化や小文字化を行わない。
+頻出ワード用の正規化はAnalyzerで別途行う。
+
+同じ送信内容であれば、取得順序、Lambda実行、SQS Message IDが変わっても同じ`batchId`となる。
+ページトークンがない初回取得も同じ規則を適用する。
+空のバッチは送信しない。
+
+`pageToken`だけからIDを作る方式は採用しない。
+同じ取得位置からの再取得で内容が変わっても、同一内容であるとは仮定しない。
+コメントが追加・削除された場合や分割境界が変わった場合は別バッチとして扱い、
+重なるコメントは9.5節のコメントID単位の処理済み管理で二重集計を防止する。
 
 ---
 
@@ -438,7 +489,8 @@ channels
            ├── comment_length_distribution
            ├── frequent_words
            ├── collection_jobs
-           └── processed_comment_batches
+           ├── processed_comment_batches
+           └── processed_comments
 ```
 
 コメント原データはAuroraではなくS3に保存する。
@@ -469,7 +521,9 @@ YouTube上の以下のIDを保持する。
 
 外部IDは重複登録を防止するため、必要に応じて一意制約を設定する。
 
-コメントIDについては、原則としてS3上のRaw Dataで管理する。
+コメントIDはS3上のRaw Dataに保持し、
+重複集計防止に必要なIDのみ`processed_comments`にも保持する。
+コメント本文はAuroraへ保存しない。
 
 ---
 
@@ -510,17 +564,34 @@ API・Web UIからの高速な参照
 
 ### 9.5. 冪等性
 
-Standard SQSでは同一メッセージが複数回配信される可能性があるため、
-コメントバッチ単位で`batchId`を付与する。
+Data Collectorの再実行とStandard SQSの重複配信の両方を対象とする。
 
-Analyzer Lambdaでは`processed_comment_batches`を利用して
-処理済み`batchId`を判定する。
+- 同じ送信内容：7.1節により同じ`batchId`を生成する
+- 異なるバッチに含まれる同じコメント：`(streamId, commentId)`で重複を排除する
 
-分析結果の更新と処理済み`batchId`の登録は
-同一のAuroraトランザクションで実行する。
+AnalyzerはS3保存成功後、以下を一つのAuroraトランザクションで実行する。
 
-S3については`batchId`から決定されるオブジェクトキーを使用し、
-再処理時にも同じオブジェクトへ保存する。
+1. `processed_comment_batches`へ`INSERT ... ON CONFLICT DO NOTHING RETURNING`で登録し、登録できなければ集計せず終了する
+2. コメントIDを昇順で`processed_comments`へ登録し、`ON CONFLICT DO NOTHING RETURNING`で新規登録できたIDだけを得る
+3. 新規コメントだけから総数、文字数合計、時間帯別件数、文字数分布、単語数を更新し、平均・速度・順位へ反映する
+4. バッチ登録、コメントID登録、分析結果更新をまとめてCommitする
+
+事前のSELECTによる処理済み確認だけで重複を判断しない。
+並行実行の競合は一意制約で制御する。加算は原子的なSQL更新とし、
+平均・順位等の再計算に必要な行ロックを取得する。
+途中失敗やデッドロック時は全体をRollbackし、失敗メッセージのみ再試行する。
+重複コメントのみのバッチは、集計値を変更せずバッチ登録をCommitする。
+
+S3には送信バッチ全体を、`batchId`から決まるキーへ保存する。
+同じバッチの再実行では同じ内容・同じキーとなる。
+異なるバッチ間には同じコメントが含まれ得るため、
+Raw Dataから再分析する場合も`(streamId, commentId)`で重複を除く。
+同じコメントIDの内容が変わった場合の訂正集計はPoC対象外とし、
+通常の集計は最初に処理済み登録できた内容を採用する。
+
+実装時には、SQS送信後・Task結果返却前の失敗、分割送信の一部失敗、
+コメント集合の部分的な重複、同一バッチ・重複コメントの並行処理、
+Aurora Commit前後の失敗で集計値が二重加算されないことを検証する。
 
 ---
 
@@ -785,8 +856,14 @@ Stream Insightでは安全性を考慮し、独自に7暦日を保存上限と�
 
 収集処理の再実行や障害発生時の調査に利用する。
 
-`processed_comment_batches`についても、
-SQSメッセージの重複処理を防止するための処理管理情報として保存する。
+`processed_comment_batches`および`processed_comments`は、
+再実行・再配信による重複集計を防止するための処理管理情報として保存する。
+
+同じ分析結果へ再投入できる期間中は、処理済み情報だけを先に削除しない。
+削除する場合は収集を停止し、実行中のTask、SQS、DLQ、手動再投入からの再処理を停止したうえで、
+対象配信の分析結果と処理済み情報を一体で削除する。
+保存期間は適用されるYouTube APIポリシーを確認して決定し、
+Raw Dataの7日保持が処理済み情報の削除時期を意味するものとはしない。
 
 ---
 

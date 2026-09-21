@@ -669,6 +669,7 @@ PostgreSQL
 - frequent_words
 - collection_jobs
 - processed_comment_batches
+- processed_comments
 
 コメント原データは保存しない。
 
@@ -681,6 +682,10 @@ Standard SQSによる重複配信に対応するため処理済み`batchId`を�
 `batchId`には一意制約を設定し、
 分析結果の更新と処理済み`batchId`の登録を
 同一トランザクションで実行する。
+
+Data Collectorの再実行時は、`data-model.md`の7.1節に従い同じ送信内容から同じ`batchId`を生成する。
+再取得時にバッチ構成が変わった場合は、`processed_comments`の`(streamId, commentId)`一意制約で重複を排除する。
+新規コメントの処理済み登録と分析結果更新も同一トランザクションで実行する。
 
 `nextPageToken`等のLambda間の継続処理状態については、
 Step Functionsの実行状態で管理するため、

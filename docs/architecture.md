@@ -246,8 +246,18 @@ Data Collector Lambda自身では配信終了まで待機しない。
 Stream Metadata Lambdaによって採番された内部`streamId`と、
 コメントバッチを一意に識別する`batchId`を含める。
 
-`batchId`はData Collector Lambdaでコメントバッチを生成した時点で一度だけ生成し、
-SQSの再配信時にも同じ値を利用できるようメッセージに含める。
+`batchId`はランダムUUID、Lambda Request ID、実行時刻、Retry回数から生成せず、
+送信対象の内容から決定的に生成する。生成仕様は`data-model.md`の7.1節に定義する。
+同じ内容のコメントバッチは、Lambdaの再実行やSQS再配信をまたいで同じIDとなる。
+
+SQS送信が成功していても、その後のLambda失敗により同じページが再取得されることがある。
+再取得でコメントの集合や分割境界が変わる可能性も考慮し、
+Analyzerでは`batchId`に加えて`(streamId, commentId)`単位でも重複を排除する。
+
+すべての分割バッチのSQS送信成功を確認した後にのみ、
+`nextPageToken`をStep Functionsへ返却する。
+一部の送信失敗・結果不明時はTaskを失敗させ、取得位置を進めず再試行する。
+空のバッチは送信しないが、取得が正常終了した場合の次ページトークンは返却する。
 
 これによりAnalyzer Lambdaは外部Video IDから内部`streamId`を解決する必要がない。
 
@@ -350,6 +360,10 @@ Standard SQSによるメッセージの重複配信に対応するため、
 分析結果の更新と`processed_comment_batches`への処理済み登録は、
 同一のAuroraトランザクション内で実行する。
 
+別の`batchId`に同じコメントが含まれる場合は、
+`processed_comments`の`(streamId, commentId)`一意制約で重複を排除する。
+新規に登録できたコメントだけを集計し、コメント処理済み登録も同じトランザクションで確定する。
+
 既に処理済みの`batchId`を受信した場合は、
 分析結果を再更新せず正常終了する。
 
@@ -409,6 +423,7 @@ Web UIやAPIから利用する分析結果およびアプリケーションデ�
 - 時間帯別コメント数
 - 頻出ワード
 - コメントバッチ処理済み情報
+- コメントID単位の処理済み情報（本文・投稿者情報は含めない）
 - その他のBI表示用データ
 
 大量のコメント原データはAuroraには保存せず、S3に保存する。
@@ -549,11 +564,18 @@ Data Collector Lambdaは1回の実行で一定範囲のコメントを取得す�
 
 Analyzer LambdaがSQSからコメントデータを取得し、以下の処理を行う。
 
-1. `batchId`が処理済みか確認する
+1. `batchId`が処理済みなら正常終了する（この事前確認だけでは並行実行を制御しない）
 2. 未処理の場合、`batchId`から決定されるS3オブジェクトキーへコメント原データを保存する
-3. コメントデータを分析する
-4. 分析結果の更新と`batchId`の処理済み登録を同一Auroraトランザクションで実行する
-5. 処理済みの場合は分析結果を再更新せず正常終了する
+3. Auroraトランザクションを開始し、`processed_comment_batches`へ`INSERT ... ON CONFLICT DO NOTHING RETURNING`で登録する。登録できなければ集計せず終了する
+4. `processed_comments`へ`(streamId, commentId)`順で登録し、`ON CONFLICT DO NOTHING RETURNING`で新規登録できたコメントIDだけを取得する
+5. 新規登録できたコメントだけを分析し、すべての集計値を更新する
+6. バッチ登録、コメントID登録、分析結果更新を同一トランザクションでCommitする。失敗時はすべてRollbackする
+
+重複コメントのみの新しいバッチも、集計値を変えずにバッチ処理済み登録をCommitする。
+並行実行時も一意制約によって同じコメントを集計できるトランザクションを一つに限定する。
+集計行の加算は原子的なSQL更新とし、平均・順位等の再計算に必要な行ロックを取得する。
+デッドロック等はトランザクション全体をRollbackし、Partial Batch Responseで再試行する。
+詳細は`data-model.md`の9.5節に従う。
 
 S3保存後に処理が失敗した場合でも、
 再実行時には同一オブジェクトキーへ保存する。
@@ -630,6 +652,9 @@ Step FunctionsのRetry機能を利用する。
 
 RetryではBackoffを設定し、
 短時間にAPIを過剰に呼び出さないようにする。
+
+SQS送信後・Task結果返却前の失敗でも、同じ送信内容から同じ`batchId`を再生成する。
+再取得によるバッチの部分的な重複は、AnalyzerのコメントID単位の重複排除で扱う。
 
 ### 6.4. 自動配信検出
 
