@@ -101,22 +101,23 @@ Data Collector Lambda
 │ Analyzer Lambda     │
 └──────────┬──────────┘
            │
-      ┌────┴────┐
-      ▼         ▼
-┌──────────┐ ┌────────────────────┐
-│ S3 Raw   │ │ Aurora Serverless  │
-│ Data     │ │ PostgreSQL         │
-└──────────┘ └─────────▲──────────┘
-                       │
-                ┌──────┴──────┐
-                │ API Lambda  │
-                └──────▲──────┘
-                       │
-                ┌──────┴──────┐
-                │ API Gateway │
-                └──────▲──────┘
-                       │
-                    Next.js
+      ┌────┴───────────────┐
+      │                    │
+      ▼                    ▼
+┌──────────────────┐ ┌────────────────────┐
+│ S3 Gateway       │ │ Aurora Serverless  │
+│ VPC Endpoint     │ │ PostgreSQL         │
+└────────┬─────────┘ └─────────▲──────────┘
+         │                      │
+         ▼               ┌──────┴──────┐
+┌──────────────────┐     │ API Lambda  │
+│ S3 Raw Data      │     └──────▲──────┘
+└──────────────────┘            │
+                         ┌──────┴──────┐
+                         │ API Gateway │
+                         └──────▲──────┘
+                                │
+                             Next.js
 ```
 
 Step Functionsは収集開始時に配信メタデータを永続化した後、
@@ -176,13 +177,17 @@ VPC内
 ├── Stream Metadata Lambda
 ├── Analyzer Lambda
 ├── API Lambda
-└── Aurora PostgreSQL
+├── Aurora PostgreSQL
+└── S3 Gateway VPC Endpoint
 ```
 
 Data Collector LambdaはAuroraへ直接接続しない。
 
 これによりData Collector LambdaはVPC外からYouTube Data APIへアクセスでき、
 YouTube Data APIアクセスのためだけにNAT Gatewayを配置することを避ける。
+
+Analyzer LambdaからRaw Data S3へのアクセスには、
+S3 Gateway VPC Endpointを利用する。
 
 ---
 
@@ -195,15 +200,53 @@ PoCでは原則としてPublic Subnet上にEC2等のサーバーは配置しな�
 
 ---
 
-### 5.4. NAT Gateway
+### 5.4. NAT Gateway / VPC Endpoint
 
 PoCではコスト削減のため、
-可能な限りNAT Gatewayを使用しない。
+NAT Gatewayは原則として使用しない。
 
 VPC内LambdaからAWSサービスへアクセスする場合は、
-必要に応じてVPC Endpointを利用する。
+通信先に応じてVPC Endpointを利用する。
 
-必要となるVPC EndpointはCDK実装時に通信経路を確認したうえで決定する。
+Analyzer LambdaはPrivate Subnet内からRaw Data S3へアクセスするため、
+S3 Gateway VPC Endpointを必須構成とする。
+
+```text
+VPC
+├── Private Subnet
+│   ├── Stream Metadata Lambda
+│   ├── Analyzer Lambda
+│   ├── API Lambda
+│   └── Aurora PostgreSQL
+│
+└── S3 Gateway VPC Endpoint
+        ↓
+    Raw Data S3
+```
+
+S3 Gateway VPC Endpointは、
+Analyzer Lambdaが配置されるPrivate SubnetのRoute Tableに関連付ける。
+
+Endpoint PolicyおよびRaw Data S3のBucket Policyでは、
+Analyzer LambdaによるRaw Data保存に必要なアクセスのみを許可する。
+
+VPC内コンポーネントが実行時にアクセスするAWSサービスについては、
+インターネット接続またはVPC Endpointが必要かを確認し、
+NAT Gatewayを使用せずに必要な通信経路を確保する。
+
+PoC時点の主な通信経路は以下とする。
+
+| コンポーネント         | 接続先                                  | 通信経路                |
+| ---------------------- | --------------------------------------- | ----------------------- |
+| Data Collector Lambda  | YouTube Data API                        | VPC外からインターネット |
+| Data Collector Lambda  | SQS / Parameter Store / Secrets Manager | VPC外からAWSサービス    |
+| Stream Metadata Lambda | Aurora PostgreSQL                       | VPC内                   |
+| Analyzer Lambda        | Aurora PostgreSQL                       | VPC内                   |
+| Analyzer Lambda        | Raw Data S3                             | S3 Gateway VPC Endpoint |
+| API Lambda             | Aurora PostgreSQL                       | VPC内                   |
+
+新たにVPC内Lambdaから他のAWSサービスへアクセスする必要が生じた場合は、
+対象サービスのVPC Endpoint追加を検討する。
 
 ---
 
@@ -306,6 +349,9 @@ Auroraの`processed_comment_batches`テーブルで処理済み`batchId`を管�
 
 Raw DataのS3オブジェクトキーには`batchId`を利用し、
 同一バッチの再処理時にも同じオブジェクトへ保存する。
+
+Analyzer LambdaからRaw Data S3へのアクセスには、
+S3 Gateway VPC Endpointを利用する。
 
 SQS Event Source MappingではPartial Batch Responseを有効化し、
 Lambdaへ渡された複数メッセージの一部が失敗した場合は、
@@ -547,6 +593,12 @@ Block Public Access: ON
 ```
 
 アクセスはIAM Roleを付与されたLambda等に限定する。
+
+Analyzer LambdaからRaw Data Bucketへのアクセスは、
+S3 Gateway VPC Endpoint経由とする。
+
+Endpoint PolicyおよびBucket Policyによって、
+必要なRaw Data Bucketへのアクセスのみを許可する。
 
 ---
 
@@ -806,6 +858,12 @@ Lambda InvokeFunction
 CloudWatch Logs
 ```
 
+S3 Gateway VPC EndpointのEndpoint Policyでは、
+Raw Data Bucketへの必要なアクセスのみを許可する。
+
+Raw Data BucketのBucket Policyについても、
+Analyzer LambdaからのRaw Data保存に必要なアクセスのみを許可する。
+
 最小権限の原則を適用する。
 
 ---
@@ -877,7 +935,10 @@ PoCでは以下のStack構成を基本とする。
 - VPC
 - Subnet
 - Security Group
-- VPC Endpoint
+- S3 Gateway VPC Endpoint
+
+S3 Gateway VPC Endpointは、
+Analyzer Lambdaが配置されるPrivate SubnetのRoute Tableへ関連付ける。
 
 ### StorageStack
 
@@ -981,7 +1042,8 @@ PoCでは以下を重視する。
 - Step Functionsによって長時間処理を分割する
 - Raw DataはS3へ保存する
 - Raw Dataを7日で削除する
-- NAT Gatewayを可能な限り使用しない
+- NAT Gatewayを原則として使用しない
+- S3アクセスにはGateway VPC Endpointを利用する
 - Auroraのキャパシティを必要最小限にする
 - CloudWatch Logsの不要な長期保存を避ける
 - Secrets Managerに保存するSecret数を必要最小限にする
