@@ -112,6 +112,34 @@ API LambdaおよびAuroraへの負荷に上限を設ける。
 
 具体的な値はPoCの利用状況を確認しながら調整する。
 
+### 2.7. CloudFrontでのAPIパス変換
+
+CloudFrontのCache Behaviorは転送先Originを選択するだけで、
+リクエストURIから`/api`を自動的に除去しない。
+
+`/api/*` Cache Behaviorのviewer-requestイベントにCloudFront Functionを関連付け、
+URI先頭の`/api/`を`/`へ置換してからAPI Gatewayへ転送する。
+
+変換はURI先頭に対して一度だけ行い、
+`streamId`等を含む残りのパスおよびクエリ文字列は変更しない。
+URI変換後も、選択済みのAPI Gateway Originへ転送する。
+
+本書のEndpointはAPI Gatewayのリソースパスを示し、
+API Gateway側には`/api`付きのリソースを追加しない。
+
+PoCではAPI Gateway REST APIのStage名を`dev`とし、
+CloudFrontのAPI Gateway OriginのOrigin Pathに`/dev`を設定する。
+Stage名はOrigin Pathで付与し、CloudFront Functionでは付与しない。
+
+| ブラウザのリクエスト              | Functionによる変換後          | API Gatewayへの転送パス（Origin Pathを含む） |
+| --------------------------------- | ----------------------------- | -------------------------------------------- |
+| `/api/streams`                    | `/streams`                    | `/dev/streams`                               |
+| `/api/streams/stream-001/metrics` | `/streams/stream-001/metrics` | `/dev/streams/stream-001/metrics`            |
+| `/api/streams?limit=20&offset=0`  | `/streams?limit=20&offset=0`  | `/dev/streams?limit=20&offset=0`             |
+
+クエリ文字列はOrigin Request Policyでも転送を許可する。
+CloudFront Function、OriginおよびPolicyの設定は`infrastructure.md`の12.2節に定義する。
+
 ---
 
 ## 3. API構成
@@ -122,6 +150,10 @@ Browser
 CloudFront
    │
    │ /api/*
+   ▼
+CloudFront Function (viewer-request)
+   │
+   │ /api/ → /（Origin Path: /dev）
    ▼
 API Gateway
    │

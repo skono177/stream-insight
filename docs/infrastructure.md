@@ -734,6 +734,9 @@ API GatewayはCloudFrontのAPI Originとして設定する。
 
 CloudFrontでは`/api/*`をAPI Gatewayへルーティングする。
 
+12.2節のCloudFront FunctionでURI先頭の`/api`を除去し、
+Origin Path `/dev`を付与してAPI Gatewayの`dev` Stageへ転送する。
+
 ブラウザからはCloudFront経由でAPIへアクセスする。
 
 PoCではユーザー認証・認可を導入しない。
@@ -828,6 +831,65 @@ API用Behaviorで許可するHTTPメソッドはGETおよび必要なHEADに限�
 APIレスポンスについては、
 PoCでは分析結果の更新を速やかに反映できるよう、
 原則としてCloudFrontキャッシュを無効化する。
+
+### 12.2.1. APIパス変換とOrigin設定
+
+CloudFrontのCache BehaviorはURIを書き換えないため、
+`/api/*` Cache Behaviorのviewer-requestイベントに
+APIパス変換用CloudFront Functionを関連付ける。
+
+FunctionはURI先頭の`/api/`を`/`へ一度だけ置換し、
+残りのパスおよびクエリ文字列を変更しない。
+Default BehaviorにはこのFunctionを関連付けない。
+
+```javascript
+function handler(event) {
+  var request = event.request;
+  if (request.uri.indexOf("/api/") === 0) {
+    request.uri = request.uri.substring(4);
+  }
+  return request;
+}
+```
+
+URI変換後も選択済みのCache BehaviorおよびAPI Gateway Originは変わらない。
+API Gatewayのリソースパスは`/streams`以下の既存定義を維持する。
+
+PoCでは以下の設定とする。
+
+| 設定項目                   | 値                                            |
+| -------------------------- | --------------------------------------------- |
+| API Gateway REST API Stage | `dev`                                         |
+| API Gateway Origin Domain  | `<api-id>.execute-api.<region>.amazonaws.com` |
+| Origin Protocol Policy     | HTTPS Only                                    |
+| Origin Path                | `/dev`                                        |
+| Function関連付け           | `/api/*` Behaviorのviewer-request             |
+| Cache Policy               | `CachingDisabled`                             |
+| Origin Request Policy      | `AllViewerExceptHostHeader`                   |
+
+Origin Domainにはパスを含めず、Stage名はOrigin Pathで一度だけ付与する。
+CDKでOrigin Pathが自動設定される場合も、最終的な値が`/dev`となるようにし、
+FunctionやリソースパスでStage名を重複付与しない。
+
+`AllViewerExceptHostHeader`でクエリ文字列を転送し、
+ブラウザのHostヘッダーは転送せず、API Gateway Originのホスト名を使用する。
+
+転送例：
+
+```text
+Browser:       /api/streams?limit=20&offset=0
+Function後:    /streams?limit=20&offset=0
+Origin送信時:  /dev/streams?limit=20&offset=0
+API Resource:  /streams（Stage: dev）
+```
+
+CloudFront FunctionはFrontendStackで作成・公開し、
+LIVEステージのFunctionをBehaviorに関連付ける。
+
+デプロイ後は、`api.md`に定義した全6エンドポイントについて
+CloudFront経由で既存のAPIリソースへ到達できること、
+`limit`・`offset`が維持されること、
+Frontend静的ファイルの配信が維持されることを確認する。
 
 ---
 
@@ -1190,6 +1252,9 @@ API LambdaにはReserved Concurrencyを設定する。
 - Frontend S3 Origin
 - API Gateway Origin
 - `/api/*` Cache Behavior
+- APIパス変換用CloudFront Function（公開およびviewer-requestへの関連付け）
+- API Gateway Origin Path（`/dev`）
+- API用Cache PolicyおよびOrigin Request Policyの関連付け
 
 ---
 
