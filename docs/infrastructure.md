@@ -411,6 +411,25 @@ SQS Event Source MappingではPartial Batch Responseを有効化し、
 Lambdaへ渡された複数メッセージの一部が失敗した場合は、
 失敗したメッセージのみを再試行対象とする。
 
+コメント急増時や障害復旧時にSQSのバックログが増加しても、
+Analyzer LambdaからAuroraへの接続が急増しないよう、以下を初期値として設定する。
+
+```text
+SQS Event Source Mapping Maximum Concurrency: 2
+Analyzer Lambda Reserved Concurrency: 2
+```
+
+Event Source MappingのMaximum ConcurrencyとAnalyzer LambdaのReserved Concurrencyを同じ値にし、
+SQS以外の経路から呼び出された場合もAnalyzer Lambda全体の同時実行数を2以下に制限する。
+
+Analyzer Lambdaは1実行につきAuroraへの物理接続を最大1本だけ作成し、
+処理の正常終了・異常終了にかかわらず実行終了前に接続を閉じる。
+これにより、Analyzer Lambdaが同時に使用するAurora接続数を最大2本に制限する。
+
+PoCでは追加費用を避けるためRDS Proxyは使用しない。
+負荷試験で接続待ちや接続エラーが確認された場合、または同時実行数を増やす場合は、
+Auroraのキャパシティ調整と合わせてRDS Proxyの導入を検討する。
+
 Auroraへの接続が必要となるためVPC内へ配置する。
 
 ---
@@ -599,6 +618,11 @@ Analyzer Lambda側で`batchId`を利用した冪等性制御を行う。
 
 Analyzer LambdaのEvent Source Mappingでは
 Partial Batch Responseを有効化する。
+
+同Event Source MappingのMaximum Concurrencyは2、
+Analyzer LambdaのReserved Concurrencyも2に設定する。
+Reserved Concurrencyは、同Lambdaに設定されたすべてのEvent Source Mappingの
+Maximum Concurrency合計以上とする。
 
 ---
 
@@ -801,6 +825,7 @@ AWS_REGION=<deployment region>
 新しい物理接続ごとに新しいトークンを生成する。
 既存接続の再利用は可能だが、期限切れトークンを新規接続へ再利用しない。
 接続プールには上限を設定し、Lambdaの同時実行数と合わせてAuroraの最大接続数を超えないようにする。
+Analyzer Lambdaでは接続プールを使用せず、1実行あたりの物理接続を1本に限定して実行終了前に閉じる。
 
 Security Groupは、Stream Metadata Lambda、Analyzer LambdaおよびAPI Lambdaから
 AuroraのTCP 5432への通信だけを許可する。
@@ -857,6 +882,15 @@ PoCでは可能な限り小さいキャパシティ設定から開始する。
 
 実際の最小・最大ACUについては、
 実装時のAurora Serverless v2仕様を確認したうえで決定する。
+
+デプロイ後に`SHOW max_connections`でAuroraの最大接続数を確認し、
+各Lambdaの同時実行上限と1実行あたりの最大接続数から接続数の上限を見積もる。
+通常時だけでなくSQSバックログ処理時にも、管理・保守用の接続余力を残す。
+
+PoCではAnalyzer Lambdaの最大接続数を2本から開始し、
+CloudWatchでAuroraの接続数、接続エラー、SQSのバックログを監視する。
+接続余力が不足する場合は、Analyzer Lambdaの同時実行数を引き下げるか、
+Auroraのキャパシティを引き上げる。
 
 ---
 
@@ -1423,7 +1457,9 @@ Removal Policy: DESTROY
 ```
 
 Analyzer LambdaのSQS Event Source Mappingでは
-Partial Batch Responseを有効化する。
+Partial Batch Responseを有効化し、Maximum Concurrencyを2に設定する。
+
+Analyzer LambdaにはReserved Concurrencyとして2を設定する。
 
 API LambdaにはReserved Concurrencyを設定する。
 
@@ -1516,6 +1552,8 @@ PoCでは以下を重視する。
 - DBスキーマ適用にはRDS Data APIを利用し、Migration用Interface VPC Endpointの固定費を発生させない
 - API GatewayにThrottlingを設定する
 - API LambdaにReserved Concurrencyを設定する
+- Analyzer LambdaのMaximum ConcurrencyおよびReserved Concurrencyを2に設定する
+- PoCではRDS Proxyを使用せず、必要性が確認された場合に導入を検討する
 - AWS Budgetsでコストを監視する
 - Auroraのキャパシティを必要最小限にする
 - CloudWatch Logsの保持期間を7日に設定する
