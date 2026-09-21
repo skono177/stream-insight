@@ -14,6 +14,12 @@ Frontendと同じCloudFront Distributionを利用し、
 
 これによりFrontendとAPIを同一オリジンとして提供する。
 
+PoCではユーザー認証・認可を実装しないため、
+API Gateway自体は認証なしの公開Read Only APIとして扱う。
+
+想定外の大量アクセスによる負荷およびコスト増加を抑制するため、
+API GatewayのThrottlingおよびAPI Lambdaの同時実行数制限を設定する。
+
 ---
 
 ## 2. API方針
@@ -28,13 +34,25 @@ HTTPメソッドおよびURLパスによってリソースを表現するREST AP
 
 ### 2.3. Read Only
 
-PoCでは分析結果の参照を目的とするため、基本的にGET APIのみを提供する。
+PoCでは分析結果の参照を目的とするため、
+GET APIのみを提供する。
 
-### 2.4. 外部API公開
+### 2.4. 公開範囲
 
-PoCでは外部ユーザー向けのAPI公開は行わない。
+PoCではAPI Gatewayにユーザー認証・認可を設定しない。
 
-将来的に認証・認可、API利用量制限、課金等を実装したうえで外部公開を検討する。
+そのためAPI Gatewayのエンドポイントは、
+技術的にはインターネットから直接アクセス可能な公開Read Only APIとして扱う。
+
+ただし、外部利用者向けの正式な公開APIとして提供するものではなく、
+Stream Insight Web UIからの参照用途を想定する。
+
+想定外の大量アクセスに備え、
+API GatewayのThrottlingおよびAPI LambdaのReserved Concurrencyによって
+利用量とバックエンド負荷を制限する。
+
+将来的に外部ユーザー向けAPIを正式に提供する場合は、
+認証・認可、APIキー、利用量制限、課金等を追加する。
 
 ### 2.5. ブラウザからのAPIアクセス
 
@@ -62,6 +80,38 @@ PoCではブラウザからのAPIアクセスのためのCORS設定を不要と�
 将来的にAPIを別オリジンから直接利用させる場合は、
 許可するOrigin、HTTP Method、Headerを明示したCORS設定を追加する。
 
+### 2.6. 利用量制御
+
+PoCでは認証を導入しない代わりに、
+API GatewayでThrottlingを設定する。
+
+初期値は以下を目安とする。
+
+```text
+Rate Limit: 5 requests/second
+Burst Limit: 10 requests
+```
+
+制限はすべてのGET APIに適用する。
+
+制限を超えたリクエストには、
+API Gatewayから以下を返す。
+
+```http
+429 Too Many Requests
+```
+
+また、API LambdaにはReserved Concurrencyを設定する。
+
+```text
+Reserved Concurrency: 5
+```
+
+これによりAPI Gatewayを直接呼び出された場合でも、
+API LambdaおよびAuroraへの負荷に上限を設ける。
+
+具体的な値はPoCの利用状況を確認しながら調整する。
+
 ---
 
 ## 3. API構成
@@ -74,34 +124,24 @@ CloudFront
    │ /api/*
    ▼
 API Gateway
-   ↓
+   │
+   │ Throttling
+   ▼
 API Lambda
-   ↓
+   │
+   │ Reserved Concurrency
+   ▼
 Aurora PostgreSQL
 ```
 
-CloudFrontはブラウザ向けの`/api`プレフィックスを除去して、
-API Gateway側のREST APIへリクエストを転送する。
+ブラウザからはCloudFront経由でアクセスする。
 
-例えば、
-
-```text
-Browser:
-GET /api/streams
-
-↓
-
-API Gateway:
-GET /streams
-```
-
-として扱う。
+API Gatewayの直接エンドポイントからアクセスされた場合も、
+API GatewayのThrottlingおよびAPI LambdaのReserved Concurrencyを適用する。
 
 ---
 
 # 4. エンドポイント一覧
-
-API Gateway内部では以下のエンドポイントを定義する。
 
 | Method | Endpoint                                  | 概要                     |
 | ------ | ----------------------------------------- | ------------------------ |
@@ -112,16 +152,8 @@ API Gateway内部では以下のエンドポイントを定義する。
 | GET    | `/streams/{streamId}/length-distribution` | コメント文字数分布を取得 |
 | GET    | `/streams/{streamId}/frequent-words`      | 頻出ワードを取得         |
 
-ブラウザからアクセスする場合は、
+CloudFront経由でブラウザからアクセスする場合は、
 各エンドポイントの先頭に`/api`を付与する。
-
-例：
-
-```text
-GET /api/streams
-GET /api/streams/{streamId}
-GET /api/streams/{streamId}/metrics
-```
 
 ---
 
@@ -130,8 +162,6 @@ GET /api/streams/{streamId}/metrics
 ## 5.1. 配信一覧取得
 
 ### Endpoint
-
-API Gateway：
 
 ```http
 GET /streams
@@ -180,8 +210,6 @@ PoCではページングの詳細仕様は実装時に決定する。
 
 ### Endpoint
 
-API Gateway：
-
 ```http
 GET /streams/{streamId}
 ```
@@ -222,8 +250,6 @@ GET /api/streams/{streamId}
 
 ### Endpoint
 
-API Gateway：
-
 ```http
 GET /streams/{streamId}/metrics
 ```
@@ -261,8 +287,6 @@ GET /api/streams/{streamId}/metrics
 ## 5.4. コメントタイムライン取得
 
 ### Endpoint
-
-API Gateway：
 
 ```http
 GET /streams/{streamId}/timeline
@@ -306,8 +330,6 @@ GET /api/streams/{streamId}/timeline
 ## 5.5. コメント文字数分布取得
 
 ### Endpoint
-
-API Gateway：
 
 ```http
 GET /streams/{streamId}/length-distribution
@@ -358,8 +380,6 @@ GET /api/streams/{streamId}/length-distribution
 ## 5.6. 頻出ワード取得
 
 ### Endpoint
-
-API Gateway：
 
 ```http
 GET /streams/{streamId}/frequent-words
@@ -417,6 +437,7 @@ PoCでは以下のステータスコードを使用する。
 | `200 OK`                    | 正常終了                     |
 | `400 Bad Request`           | リクエストパラメータ不正     |
 | `404 Not Found`             | 指定したリソースが存在しない |
+| `429 Too Many Requests`     | API利用量制限超過            |
 | `500 Internal Server Error` | サーバー内部エラー           |
 
 ---
@@ -440,7 +461,11 @@ PoCでは以下のステータスコードを使用する。
 | -------------------- | ----------: | -------------------- |
 | `INVALID_REQUEST`    |         400 | リクエスト不正       |
 | `RESOURCE_NOT_FOUND` |         404 | リソースが存在しない |
+| `TOO_MANY_REQUESTS`  |         429 | API利用量制限超過    |
 | `INTERNAL_ERROR`     |         500 | 内部エラー           |
+
+API GatewayのThrottlingによって拒否されたリクエストについては、
+API Gatewayが返す429レスポンスを利用する。
 
 ---
 
@@ -521,7 +546,8 @@ POST /comments
 POST /analysis
 ```
 
-PoCでは分析処理をデータ収集・非同期処理側で実行するため、外部から分析処理を開始するAPIは提供しない。
+PoCでは分析処理をデータ収集・非同期処理側で実行するため、
+外部から分析処理を開始するAPIは提供しない。
 
 ---
 
@@ -536,9 +562,16 @@ POST /users
 
 ---
 
-## 10.4. 外部API
+## 10.4. 外部ユーザー向けAPI
 
-外部ユーザー向けAPIキー発行、認証、利用量制限、課金等はPoCでは対象外とする。
+PoCのAPI Gatewayは認証なしでインターネットから到達可能だが、
+外部ユーザー向けの正式なAPIサービスとしては提供しない。
+
+外部ユーザー向けAPIキー発行、ユーザー認証、課金等はPoCでは対象外とする。
+
+PoCではAPI Gateway Throttling、
+API Lambda Reserved Concurrency、
+AWS Budgetsによって利用量・バックエンド負荷・コストを制御する。
 
 ---
 

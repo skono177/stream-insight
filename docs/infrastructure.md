@@ -12,6 +12,7 @@ PoCでは以下を重視する。
 - 高速な開発
 - Infrastructure as Codeによる再現性
 - 将来的なスケールアウトへの対応
+- PoCの想定外利用による負荷・コスト増加の抑制
 
 AWSリソースはAWS CDKで管理する。
 
@@ -37,6 +38,7 @@ PoCでは以下のAWSサービスを利用する。
 | API Key管理           | AWS Systems Manager Parameter Store    |
 | OAuth認証情報管理     | AWS Secrets Manager                    |
 | ログ・監視            | Amazon CloudWatch                      |
+| コスト監視            | AWS Budgets                            |
 | IaC                   | AWS CDK                                |
 
 ---
@@ -59,11 +61,14 @@ PoCでは以下のAWSサービスを利用する。
                 ▼                           ▼
        ┌─────────────────┐        ┌─────────────────┐
        │ S3 Frontend     │        │   API Gateway   │
-       │   Next.js       │        └────────┬────────┘
-       └─────────────────┘                 │
+       │   Next.js       │        │  Throttling     │
+       └─────────────────┘        └────────┬────────┘
+                                           │
                                            ▼
                                   ┌─────────────────┐
                                   │   API Lambda    │
+                                  │ Reserved        │
+                                  │ Concurrency     │
                                   └────────┬────────┘
                                            │
                                            ▼
@@ -143,6 +148,10 @@ Default BehaviorではFrontend S3へルーティングし、
 `/api/*`へのリクエストはAPI Gatewayへルーティングする。
 
 これによりブラウザからFrontendとAPIを同一オリジンとして利用する。
+
+PoCではAPI利用者向けの認証・認可は実装しないため、
+API GatewayおよびAPI Lambdaに利用量・同時実行数の上限を設定し、
+想定外の大量アクセスによる負荷およびコスト増加を抑制する。
 
 Step Functionsは収集開始時に配信メタデータを永続化した後、
 Data Collector Lambdaを繰り返し呼び出し、
@@ -400,6 +409,20 @@ stream-insight-api
 ```
 
 Auroraへの接続が必要となるためVPC内へ配置する。
+
+PoCではAPI LambdaにReserved Concurrencyを設定し、
+同時実行数に上限を設ける。
+
+初期値は以下を目安とする。
+
+```text
+Reserved Concurrency: 5
+```
+
+これによりAPI Gatewayへ大量のリクエストが送信された場合でも、
+API LambdaからAuroraへ作成される同時接続およびLambda実行数を制限する。
+
+値はPoCの負荷状況を確認しながら調整する。
 
 ---
 
@@ -711,26 +734,30 @@ API GatewayはCloudFrontのAPI Originとして設定する。
 
 CloudFrontでは`/api/*`をAPI Gatewayへルーティングする。
 
-ブラウザからはCloudFront経由で以下の形式でAPIへアクセスする。
+ブラウザからはCloudFront経由でAPIへアクセスする。
+
+PoCではユーザー認証・認可を導入しない。
+
+そのためAPI Gateway自体は公開Read Only APIとして扱い、
+想定外の大量アクセスを抑制するためStage/Method Throttlingを設定する。
+
+PoCの初期値は以下を目安とする。
 
 ```text
-/api/streams
-/api/streams/{streamId}
-/api/streams/{streamId}/metrics
-/api/streams/{streamId}/timeline
-/api/streams/{streamId}/length-distribution
-/api/streams/{streamId}/frequent-words
+Rate Limit: 5 requests/second
+Burst Limit: 10 requests
 ```
 
-CloudFrontからAPI Gatewayへ転送する際は、
-`/api`プレフィックスを除去してAPI Gateway側の既存パスへ転送する。
+すべてのGET APIを対象とし、
+PoCの利用状況を確認しながら調整する。
 
-これによりFrontendとAPIを同一オリジンとして提供し、
-PoCではブラウザからのAPIアクセスのためのCORS設定を不要とする。
+制限を超えたリクエストについては、
+API Gatewayから`429 Too Many Requests`を返す。
+
+CloudFrontを迂回してAPI Gatewayの直接URLへアクセスされた場合も、
+同じThrottlingを適用する。
 
 詳細は`api.md`に定義する。
-
-PoCでは外部ユーザー向けAPIとしての公開は行わない。
 
 ---
 
@@ -801,15 +828,6 @@ API用Behaviorで許可するHTTPメソッドはGETおよび必要なHEADに限�
 APIレスポンスについては、
 PoCでは分析結果の更新を速やかに反映できるよう、
 原則としてCloudFrontキャッシュを無効化する。
-
-用途：
-
-- HTTPS
-- CDN
-- フロントエンド配信
-- APIルーティング
-- S3の直接公開防止
-- FrontendとAPIの同一オリジン化
 
 ---
 
@@ -955,19 +973,54 @@ LambdaおよびStep FunctionsのログはCloudWatchへ出力する。
 - Lambda Error
 - Lambda Duration
 - Lambda Throttle
+- API Lambda Throttle
 - Step Functions Execution Failed
 - Step Functions Execution Timed Out
 - SQS Queue Depth
 - SQS DLQ Messages
 - API Gateway 4xx
 - API Gateway 5xx
+- API Gateway 429
 - Auroraエラー
 - YouTube APIエラー
 - OAuth 2.0 Token取得エラー
 
 OAuth Client Secret、Refresh Token、Access Token等の認証情報はログへ出力しない。
 
-PoCではCloudWatch Alarmの作り込みは最低限とする。
+PoCでは最低限のCloudWatch Alarmを設定する。
+
+対象：
+
+```text
+API Gateway 5xx
+API Gateway 429
+API Lambda Throttle
+SQS DLQ Messages
+```
+
+---
+
+### 15.1. コスト監視
+
+PoCの想定外利用による課金増加を早期に検知するため、
+AWS Budgetsを設定する。
+
+月額予算を設定し、
+実績コストまたは予測コストが設定したしきい値を超えた場合に通知する。
+
+具体的な月額予算額および通知先は、
+利用開始時の想定コストに基づいて決定する。
+
+PoCでは少なくとも以下の通知段階を設定する。
+
+```text
+50%
+80%
+100%
+```
+
+AWS Budgetsはコスト超過を自動的に完全停止する仕組みではないため、
+API Gateway ThrottlingおよびLambda Reserved Concurrencyと組み合わせて利用する。
 
 ---
 
@@ -1015,9 +1068,6 @@ PoCでは以下のStack構成を基本とする。
 - Security Group
 - S3 Gateway VPC Endpoint
 
-S3 Gateway VPC Endpointは、
-Analyzer Lambdaが配置されるPrivate SubnetのRoute Tableへ関連付ける。
-
 ### StorageStack
 
 管理対象：
@@ -1037,11 +1087,16 @@ Analyzer Lambdaが配置されるPrivate SubnetのRoute Tableへ関連付ける�
 - API Lambda
 - Step Functions State Machine
 - API Gateway
+- API Gateway Throttling
 - Parameter Store
 - Secrets Manager
+- CloudWatch Alarm
+- AWS Budget
 
 Analyzer LambdaのSQS Event Source Mappingでは
 Partial Batch Responseを有効化する。
+
+API LambdaにはReserved Concurrencyを設定する。
 
 ### FrontendStack
 
@@ -1125,6 +1180,9 @@ PoCでは以下を重視する。
 - Raw Dataを7日で削除する
 - NAT Gatewayを原則として使用しない
 - S3アクセスにはGateway VPC Endpointを利用する
+- API GatewayにThrottlingを設定する
+- API LambdaにReserved Concurrencyを設定する
+- AWS Budgetsでコストを監視する
 - Auroraのキャパシティを必要最小限にする
 - CloudWatch Logsの不要な長期保存を避ける
 - Secrets Managerに保存するSecret数を必要最小限にする
