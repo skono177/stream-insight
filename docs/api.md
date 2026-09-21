@@ -304,7 +304,8 @@ GET /api/streams/{streamId}/metrics
   "totalComments": 12500,
   "averageCommentLength": 12.8,
   "averageCommentsPerMinute": 104.2,
-  "analysisEndAt": "2026-08-23T17:00:00Z"
+  "analysisEndAt": "2026-08-23T17:00:00Z",
+  "analysisStatus": "COMPLETED"
 }
 ```
 
@@ -314,12 +315,15 @@ GET /api/streams/{streamId}/metrics
 - 平均コメント文字数
 - 平均コメント速度
 - 分析基準日時
+- 分析状態
 - その他の配信単位の指標
 
 `averageCommentsPerMinute`は、
 `[startedAt, analysisEndAt)`に含まれる総コメント数を同期間の分数で除して算出する。
 配信終了後の確定値では`analysisEndAt`に実終了日時を使用する。
 配信中の値は`analysisEndAt`時点の暫定値とする。
+`analysisStatus`はPENDING / FINALIZING / COMPLETED / FAILEDのいずれかを返す。
+終了後の確定値として扱えるのはCOMPLETEDの場合だけとする。
 
 ---
 
@@ -348,6 +352,7 @@ GET /api/streams/{streamId}/timeline
   "streamId": "stream-001",
   "unit": "minute",
   "analysisEndAt": "2026-08-23T15:02:00Z",
+  "analysisStatus": "PENDING",
   "items": [
     {
       "startAt": "2026-08-23T15:00:00Z",
@@ -374,6 +379,9 @@ GET /api/streams/{streamId}/timeline
 部分区間の`commentsPerMinute`は、
 `commentCount * 60 / (endAt - startAtの秒数)`で1分あたりに換算する。
 全体平均およびタイムラインは同じ`analysisEndAt`を使用する。
+`analysisStatus`がCOMPLETEDになるまではタイムラインを暫定値として扱う。
+COMPLETEDの場合は、送信済みバッチの分析完了確認と終了時刻までの0件区間補完が完了しており、
+`analysisEndAt`は`endedAt`と一致する。
 
 ---
 

@@ -153,11 +153,13 @@ Step Functionsの実行状態には主に以下の情報を保持する。
 
 ```text
 streamId
+collectionJobId
 videoId
 liveChatId
 nextPageToken
 pollingInterval
 collectionStatus
+analysisStatus
 ```
 
 `nextPageToken`を次回のData Collector Lambda呼び出しへ引き継ぐことで、
@@ -190,7 +192,11 @@ nextPageToken取得
   │   ↓
   │  Persist Final Metadata / Collection Status (Stream Metadata Lambda)
   │   ↓
-  │  保存成功後にEnd（失敗時はRetry / Catch）
+  │  Finalize Analysis (Analysis Finalizer Lambda)
+  │   ↓
+  │  未処理バッチあり？
+  │    ├─ Yes → Wait 10秒 → Finalize Analysis
+  │    └─ No  → analysisStatus=COMPLETED → End
   │
   └─ No
       ↓
@@ -206,7 +212,7 @@ Wait時間はYouTube Data APIから取得できるポーリング間隔を考慮
 一時的なエラーについてはStep FunctionsのRetry機能を利用する。
 
 配信またはLive Chatの終了検知時は6.5節の終了処理へ進み、
-最終メタデータと収集状態の保存成功後にワークフローを正常終了する。
+最終メタデータ、収集状態および確定済み分析状態の保存成功後にワークフローを正常終了する。
 
 収集TaskのRetry上限到達等はCatchから終了処理へ進み、
 収集失敗を記録してから異常終了する。保存自体の失敗も通知対象とする。
@@ -252,6 +258,7 @@ Data Collector Lambda自身では配信終了まで待機しない。
 
 コメントをSQSへ送信する際には、
 Stream Metadata Lambdaによって採番された内部`streamId`と、
+収集ジョブを識別する`collectionJobId`、
 コメントバッチを一意に識別する`batchId`を含める。
 
 `batchId`はランダムUUID、Lambda Request ID、実行時刻、Retry回数から生成せず、
@@ -263,7 +270,7 @@ SQS送信が成功していても、その後のLambda失敗により同じペ�
 Analyzerでは`batchId`に加えて`(streamId, commentId)`単位でも重複を排除する。
 
 すべての分割バッチのSQS送信成功を確認した後にのみ、
-`nextPageToken`をStep Functionsへ返却する。
+送信成功した`batchId`の一覧と`nextPageToken`をStep Functionsへ返却する。
 一部の送信失敗・結果不明時はTaskを失敗させ、取得位置を進めず再試行する。
 空のバッチは送信しないが、取得が正常終了した場合の次ページトークンは返却する。
 
@@ -285,7 +292,8 @@ Aurora PostgreSQLへ永続化する。
 - YouTube Video IDを外部IDとして`streams`を作成または更新
 - 内部`channelId`の採番・取得
 - 内部`streamId`の採番・取得
-- 内部`streamId`をStep Functionsへ返却
+- 内部`streamId`および`collectionJobId`をStep Functionsへ返却
+- SQS送信成功済み`batchId`の`collection_job_batches`への冪等登録
 - `collection_jobs`の開始登録および終了状態更新
 - 終了時の`streams.endedAt`を含む最終メタデータ更新
 
@@ -337,13 +345,14 @@ Stream Metadata LambdaはAuroraへアクセスするためVPC内へ配置する�
 
 PoCでは、複数のコメントを1メッセージにまとめて送信する方式を基本とする。
 
-SQSへ送信するコメントデータには内部`streamId`および`batchId`を含める。
+SQSへ送信するコメントデータには内部`streamId`、`collectionJobId`および`batchId`を含める。
 
 概念的なメッセージ：
 
 ```text
 batchId
 streamId
+collectionJobId
 videoId
 comments
 ```
@@ -479,7 +488,26 @@ Aurora PostgreSQLから分析結果を取得してレスポンスを返す。
 
 ---
 
-### 4.11. Next.js
+### 4.11. Analysis Finalizer Lambda
+
+配信終了後、送信成功済みのコメントバッチがすべて分析済みであることを確認し、
+配信全体の分析結果を確定する。
+
+主な責務：
+
+- `collection_job_batches`と`processed_comment_batches`の突合
+- 未処理バッチがある場合の待機判定返却
+- `streams.endedAt`までのコメント0件区間の補完
+- 部分区間を含むコメント速度の再計算
+- `stream_metrics.analysisEndAt`の`streams.endedAt`への固定
+- `collection_jobs.analysisStatus`および`analysisFinalizedAt`の更新
+
+確定処理は一つのAuroraトランザクションで冪等に実行する。
+未処理バッチが残っている場合は更新せず、Step FunctionsへPENDINGを返す。
+
+---
+
+### 4.12. Next.js
 
 分析結果をWeb UIとして表示する。
 
@@ -552,7 +580,12 @@ Data Collector Lambda
 
 Data Collector Lambdaは1回の実行で一定範囲のコメントを取得する。
 
-取得したコメントには内部`streamId`および`batchId`を付与してSQSへ送信する。
+取得したコメントには内部`streamId`、`collectionJobId`および`batchId`を付与してSQSへ送信する。
+
+Data Collector LambdaはSQSから送信成功応答を受け取った`batchId`をStep Functionsへ返す。
+Step Functionsは取得位置を進める前にStream Metadata Lambdaを呼び出し、
+対象`collectionJobId`の`collection_job_batches`へ`batchId`を冪等に登録する。
+登録に失敗した場合は取得位置を進めず再試行する。
 
 次回取得位置を示す`nextPageToken`はStep Functionsの実行状態として保持し、
 次回のLambda呼び出しへ引き継ぐ。
@@ -605,7 +638,36 @@ AuroraトランザクションのCommit後にSQSメッセージが再配信さ�
 
 ---
 
-### 5.4. Web UIからの参照
+### 5.4. 分析完了待ち・確定
+
+```text
+Persist Final Metadata
+        ↓
+Analysis Finalizer Lambda
+        ↓
+未処理バッチあり？
+   ├── Yes → Wait 10秒 → Analysis Finalizer Lambda
+   └── No  → 分析結果確定 → End
+```
+
+Step Functionsは`streams.endedAt`および収集終了状態の保存後、
+Analysis Finalizer Lambdaを呼び出す。
+
+Analysis Finalizerは、対象`collectionJobId`の`collection_job_batches`に登録された全`batchId`が
+`processed_comment_batches`へ登録済みかを確認する。
+未処理バッチがある場合はPENDINGを返し、Step Functionsは10秒待機して再確認する。
+
+未処理バッチが0件になった場合は、`streams.endedAt`までの空区間を補完し、
+全体平均およびタイムラインを再計算して`analysisEndAt`を`endedAt`へ固定する。
+同じ確定要求の再実行では確定済み結果を重複更新しない。
+
+DLQへの移動等で未処理バッチが残ったまま待機開始から30分を超えた場合、
+または確定処理の再試行上限へ到達した場合は`analysisStatus=FAILED`としてFailへ遷移し、
+未確定の結果を確定済みとして公開しない。
+
+---
+
+### 5.5. Web UIからの参照
 
 ```text
 Next.js
@@ -685,11 +747,12 @@ PoC完了後、EventBridge等を利用した自動化を検討する。
 
 配信またはLive Chatの終了検知時は、そのままEndへ遷移せず、以下を実行する。
 
-1. 取得済みコメントの全分割バッチのSQS送信成功を確認する。送信失敗時は正常終了扱いにしない
+1. 取得済みコメントの全分割バッチについて、SQS送信成功と`collection_job_batches`への登録成功を確認する。失敗時は正常終了扱いにしない
 2. Step Functionsで`collectionStoppedAt`を一度だけ確定し、Execution ARN、内部`streamId`、`videoId`、停止理由とともに保持する
 3. Data Collectorを最終メタデータ取得モードで呼び出し、`videos.list(part=snippet,liveStreamingDetails, id=videoId)`からタイトル、実開始日時、実終了日時を再取得する。このモードではコメントを再送信しない
-4. Stream Metadata Lambdaへ必要項目を渡し、`streams`の最終メタデータと対象`collection_jobs`の終了状態を同一トランザクションで保存する
-5. 保存成功応答後にのみ正常終了する
+4. Stream Metadata Lambdaへ必要項目を渡し、`streams`の最終メタデータ、対象`collection_jobs`の終了状態および`analysisStatus=FINALIZING`を同一トランザクションで保存する
+5. Analysis Finalizer Lambdaで送信済みバッチの分析完了を確認する。未処理の場合は10秒待機して再確認する
+6. 未処理バッチが0件になったら、終了時刻までの分析結果と`analysisEndAt`を確定し、`analysisStatus=COMPLETED`の保存成功後にのみ正常終了する
 
 `streams.endedAt`には`liveStreamingDetails.actualEndTime`をUTCで保存する。
 収集停止時刻、現在時刻、予定終了時刻を代用しない。
@@ -707,8 +770,9 @@ Step FunctionsのWaitで30秒間隔、初回を含め最大5回まで再取得�
 
 収集中のエラーで停止した場合もCatchから同じ終了処理へ進める。
 実終了日時を取得できても、収集失敗があった実行をCOMPLETEDに変更しない。
-収集失敗がなく、実終了日時と終了状態を保存できた場合のみCOMPLETEDとする。
-COMPLETEDは収集ワークフローの完了を表し、SQSの消化・分析完了を意味しない。
+収集失敗がなく、実終了日時と終了状態を保存できた場合のみ`collectionStatus=COMPLETED`とする。
+`collectionStatus=COMPLETED`は収集完了、`analysisStatus=COMPLETED`はSQS消化後の分析確定を表す。
+State Machine Executionは両方がCOMPLETEDになった場合だけ正常終了する。
 
 DB保存は初回を含め最大4回、2秒・4秒・8秒のBackoffで再試行する。
 保存失敗またはCommit後の応答喪失では、保持済みの同じ終了要求を再送する。
@@ -723,7 +787,8 @@ DB障害時に収集状態まで保存できたとは扱わない。
 手動停止・State Machine全体のタイムアウト等でCatchを実行できなかった場合も、この手順で補完する。
 
 実装時は、正常終了、実終了日時の反映遅延、Live Chatのみ終了、
-API取得失敗、DB Commit前の失敗・Commit後の応答喪失を検証する。
+API取得失敗、DB Commit前の失敗・Commit後の応答喪失、
+Analyzerの遅延、重複バッチ、0件配信、DLQ移動および分析確定タイムアウトを検証する。
 終了保存後に`GET /streams`と`GET /streams/{streamId}`が同じ実終了日時を返すことも確認する。
 
 ---

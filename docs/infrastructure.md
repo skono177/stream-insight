@@ -32,6 +32,7 @@ PoCでは以下のAWSサービスを利用する。
 | 配信メタデータ保存          | AWS Lambda                             |
 | コメント収集制御            | AWS Step Functions                     |
 | コメント分析                | AWS Lambda                             |
+| 分析完了確認・確定          | AWS Lambda                             |
 | 非同期処理                  | Amazon SQS                             |
 | Raw Data保存                | Amazon S3                              |
 | 分析結果保存                | Amazon Aurora Serverless v2 PostgreSQL |
@@ -210,6 +211,7 @@ VPC外
 VPC内
 ├── Stream Metadata Lambda
 ├── Analyzer Lambda
+├── Analysis Finalizer Lambda
 ├── API Lambda
 ├── Aurora PostgreSQL
 └── S3 Gateway VPC Endpoint
@@ -271,7 +273,7 @@ Analyzer Lambdaが配置されるPrivate SubnetのRoute Tableに関連付ける�
 Endpoint PolicyおよびRaw Data S3のBucket Policyでは、
 Analyzer LambdaによるRaw Data保存に必要なアクセスのみを許可する。
 
-Stream Metadata Lambda、Analyzer LambdaおよびAPI LambdaはIAM DB認証を利用し、
+Stream Metadata Lambda、Analyzer Lambda、Analysis Finalizer LambdaおよびAPI LambdaはIAM DB認証を利用し、
 Aurora管理者Secretへアクセスしない。
 IAM認証トークンはLambda実行Roleの一時認証情報を使って実行環境内で署名生成するため、
 トークン生成のためのSecrets Manager、RDS API、STSへの実行時通信は行わない。
@@ -294,6 +296,7 @@ PoC時点の主な通信経路は以下とする。
 | Stream Metadata Lambda | Aurora PostgreSQL Writer Endpoint       | VPC内、TCP 5432         |
 | Analyzer Lambda        | Aurora PostgreSQL Writer Endpoint       | VPC内、TCP 5432         |
 | Analyzer Lambda        | Raw Data S3                             | S3 Gateway VPC Endpoint |
+| Analysis Finalizer Lambda | Aurora PostgreSQL Writer Endpoint    | VPC内、TCP 5432         |
 | API Lambda             | Aurora PostgreSQL Cluster Endpoint      | VPC内、TCP 5432         |
 | Migration Lambda       | RDS Data API / Aurora管理者Secret       | VPC外からAWSサービス    |
 
@@ -339,7 +342,11 @@ VPC外へ配置する。
 
 SQSへ送信するコメントデータには、
 Stream Metadata Lambdaによって採番された内部`streamId`と
-コメントバッチを一意に識別する`batchId`を含める。
+`collectionJobId`、コメントバッチを一意に識別する`batchId`を含める。
+
+SQSから送信成功応答を受け取った`batchId`の一覧をStep Functionsへ返す。
+Step Functionsは取得位置を進める前にStream Metadata Lambdaを呼び出し、
+対象収集ジョブの`collection_job_batches`へ送信済みバッチを登録する。
 
 ---
 
@@ -352,9 +359,10 @@ Stream Metadata Lambdaによって採番された内部`streamId`と
 - `streams`の作成・更新
 - 終了時の最終メタデータ（`endedAt`を含む）更新
 - Execution ARNを一意キーとする`collection_jobs`の開始登録・終了状態更新
+- SQS送信成功済み`batchId`の`collection_job_batches`への冪等登録
 - 内部`channelId`の採番・取得
 - 内部`streamId`の採番・取得
-- Step Functionsへの内部`streamId`返却
+- Step Functionsへの内部`streamId`および`collectionJobId`返却
 
 想定Function名：
 
@@ -434,7 +442,33 @@ Auroraへの接続が必要となるためVPC内へ配置する。
 
 ---
 
-### 6.4. API Lambda
+### 6.4. Analysis Finalizer Lambda
+
+役割：
+
+- `collection_job_batches`と`processed_comment_batches`の突合
+- 未処理バッチが残る場合のPENDING返却
+- 終了時刻までのコメント0件区間の補完
+- コメント速度および全体平均の再計算
+- `stream_metrics.analysisEndAt`の`streams.endedAt`への固定
+- `collection_jobs.analysisStatus`と`analysisFinalizedAt`の更新
+
+想定Function名：
+
+```text
+stream-insight-analysis-finalizer
+```
+
+Step Functionsから配信終了後に呼び出す。
+未処理バッチが0件で`streams.endedAt`が保存済みの場合だけ、
+分析結果と分析状態を一つのAuroraトランザクションで冪等に確定する。
+
+Auroraへ接続するためVPC内へ配置し、Reserved Concurrencyは1とする。
+1実行につき物理接続を最大1本とし、実行終了前に閉じる。
+
+---
+
+### 6.5. API Lambda
 
 役割：
 
@@ -517,7 +551,11 @@ Live Chat終了？
   │     ↓
   │    Persist Final Metadata / Collection Status (Stream Metadata Lambda)
   │     ↓
-  │    保存成功後にEnd（失敗時はRetry / Catch）
+  │    Finalize Analysis (Analysis Finalizer Lambda)
+  │     ↓
+  │    未処理バッチあり？
+  │      ├── Yes → Wait 10秒 → Finalize Analysis
+  │      └── No  → analysisStatus=COMPLETED → End
   │
   └── No
         ↓
@@ -533,11 +571,13 @@ Data Collector LambdaおよびStream Metadata Lambdaから返却された
 
 ```text
 streamId
+collectionJobId
 videoId
 liveChatId
 nextPageToken
 pollingInterval
 collectionStatus
+analysisStatus
 ```
 
 これによりLambdaの実行時間上限を超える長時間配信についても、
@@ -566,6 +606,10 @@ RetryではBackoffを設定する。
 
 終了時の最終メタデータ取得は初回を含め最大5回、30秒間隔のWaitで再試行する。
 DB保存は初回を含め最大4回、2秒・4秒・8秒のBackoffで再試行する。
+分析完了確認は10秒間隔で行い、待機開始から30分を上限とする。
+DLQへの移動等で未処理バッチが残ったまま上限へ到達した場合、
+または確定処理のRetry上限到達時は、
+`analysisStatus=FAILED`を保存してState Machine Executionを失敗させる。
 終了時の再試行・復旧手順は`architecture.md`の6.5節に従う。
 
 ---
@@ -769,7 +813,7 @@ Public Access: Disabled
 ```
 
 Security Groupによって、
-Stream Metadata Lambda、API LambdaおよびAnalyzer Lambdaからのアクセスのみ許可する。
+Stream Metadata Lambda、Analyzer Lambda、Analysis Finalizer LambdaおよびAPI Lambdaからのアクセスのみ許可する。
 
 ---
 
@@ -779,11 +823,12 @@ Aurora PostgreSQLではIAM DB認証を有効化する。
 
 アプリケーション実行時に接続するLambdaごとに、以下のDBユーザーを作成する。
 
-| Lambda                 | DBユーザー             | DB権限                                                                                                  |
-| ---------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------- |
-| Stream Metadata Lambda | `stream_metadata_user` | `channels`、`streams`、`collection_jobs`への必要なSELECT / INSERT / UPDATE、および採番用SequenceのUSAGE |
-| Analyzer Lambda        | `analyzer_user`        | 分析結果・処理済み管理テーブルへの必要なSELECT / INSERT / UPDATE、および採番用SequenceのUSAGE           |
-| API Lambda             | `api_readonly_user`    | APIが参照するテーブルへのSELECTのみ                                                                     |
+| Lambda                    | DBユーザー               | DB権限                                                                                                                        |
+| ------------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| Stream Metadata Lambda    | `stream_metadata_user`   | `channels`、`streams`、`collection_jobs`、`collection_job_batches`への必要なSELECT / INSERT / UPDATE、およびSequenceのUSAGE |
+| Analyzer Lambda           | `analyzer_user`          | 分析結果・処理済み管理テーブルへの必要なSELECT / INSERT / UPDATE、およびSequenceのUSAGE                                    |
+| Analysis Finalizer Lambda | `analysis_finalizer_user` | 送信・処理済みバッチのSELECT、分析結果・`collection_jobs`への必要なSELECT / INSERT / UPDATE                               |
+| API Lambda                | `api_readonly_user`      | APIが参照するテーブルへのSELECTのみ                                                                                           |
 
 各ユーザーにはPostgreSQLの`rds_iam`ロールを付与する。
 アプリケーションLambdaへ管理者権限、DDL権限、他コンポーネント用テーブルへの不要な権限を付与しない。
@@ -826,8 +871,9 @@ AWS_REGION=<deployment region>
 既存接続の再利用は可能だが、期限切れトークンを新規接続へ再利用しない。
 接続プールには上限を設定し、Lambdaの同時実行数と合わせてAuroraの最大接続数を超えないようにする。
 Analyzer Lambdaでは接続プールを使用せず、1実行あたりの物理接続を1本に限定して実行終了前に閉じる。
+Analysis Finalizer Lambdaも1実行あたりの物理接続を1本に限定して実行終了前に閉じる。
 
-Security Groupは、Stream Metadata Lambda、Analyzer LambdaおよびAPI Lambdaから
+Security Groupは、Stream Metadata Lambda、Analyzer Lambda、Analysis Finalizer LambdaおよびAPI Lambdaから
 AuroraのTCP 5432への通信だけを許可する。
 AuroraはPublic Accessを無効化し、インターネットからの接続を許可しない。
 
@@ -850,7 +896,7 @@ Migration Lambdaはデプロイ時のCustom Resourceから呼び出し、
 RDS Data APIのトランザクションおよびSQL実行APIを利用して、以下を冪等に実行する。
 
 - テーブル、インデックスおよび制約の作成・更新
-- `stream_metadata_user`、`analyzer_user`、`api_readonly_user`の作成
+- `stream_metadata_user`、`analyzer_user`、`analysis_finalizer_user`、`api_readonly_user`の作成
 - 各DBユーザーへの`rds_iam`付与
 - 各DBユーザーへの最小限のテーブル・シーケンス権限付与
 - 不要な`PUBLIC`権限の取消し
@@ -1194,6 +1240,14 @@ Resource: arn:aws:rds-db:<region>:<account-id>:dbuser:<cluster-resource-id>/anal
 CloudWatch Logs
 ```
 
+### Analysis Finalizer Lambda
+
+```text
+rds-db:connect
+Resource: arn:aws:rds-db:<region>:<account-id>:dbuser:<cluster-resource-id>/analysis_finalizer_user
+CloudWatch Logs
+```
+
 ### API Lambda
 
 ```text
@@ -1254,6 +1308,7 @@ PoCではCloudWatch Logsの保持期間を以下とする。
 | Data Collector Lambda        |      7日 | 削除           |
 | Stream Metadata Lambda       |      7日 | 削除           |
 | Analyzer Lambda              |      7日 | 削除           |
+| Analysis Finalizer Lambda    |      7日 | 削除           |
 | API Lambda                   |      7日 | 削除           |
 | API Gateway Access Log       |      7日 | 削除           |
 | Step Functions Execution Log |      7日 | 削除           |
@@ -1324,6 +1379,7 @@ batchId
 - Step Functions Execution Timed Out
 - SQS Queue Depth
 - SQS DLQ Messages
+- Analysis Finalizer Lambda Error
 - API Gateway 4xx
 - API Gateway 5xx
 - API Gateway 429
@@ -1340,6 +1396,7 @@ API Gateway 5xx
 API Gateway 429
 API Lambda Throttle
 SQS DLQ Messages
+Analysis Finalizer Lambda Error
 Step Functions Execution Failed
 Step Functions Execution Timed Out
 ```
@@ -1436,6 +1493,7 @@ PoCでは以下のStack構成を基本とする。
 - VPC外のMigration Lambda / Custom Resource
 - Stream Metadata Lambda
 - Analyzer Lambda
+- Analysis Finalizer Lambda
 - API Lambda
 - Step Functions State Machine
 - API Gateway
@@ -1460,6 +1518,8 @@ Analyzer LambdaのSQS Event Source Mappingでは
 Partial Batch Responseを有効化し、Maximum Concurrencyを2に設定する。
 
 Analyzer LambdaにはReserved Concurrencyとして2を設定する。
+
+Analysis Finalizer LambdaにはReserved Concurrencyとして1を設定する。
 
 API LambdaにはReserved Concurrencyを設定する。
 

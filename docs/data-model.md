@@ -323,12 +323,20 @@ YouTubeからのデータ収集処理を管理するための情報を表す。
 | `collectionStoppedAt` | コメント収集を停止した時刻。終了処理への遷移時に一度だけ確定する                  |
 | `stopReason`          | 配信・Live Chat終了、API継続不能、Retry上限等の停止理由                           |
 | `errorCode`           | 最終メタデータ未取得等を含むエラー種別。レスポンス本文や認証情報は保存しない      |
+| `analysisStatus`      | PENDING / FINALIZING / COMPLETED / FAILED                                         |
+| `analysisFinalizedAt` | Analysis Finalizerが終了後の分析結果を確定した日時                                |
 
 開始時にRUNNINGで登録する。
 終了時は`streams`の最終メタデータ更新と同一トランザクションで終了状態を保存する。
-収集失敗がなく実終了日時の保存まで成功した場合だけCOMPLETEDとし、
+収集失敗がなく実終了日時の保存まで成功した場合だけ`collectionStatus`をCOMPLETEDとし、
 収集失敗・最終メタデータ未取得時はFAILEDとする。
-COMPLETEDはSQSの消化やAnalyzerの分析完了を保証しない。
+
+`analysisStatus`は開始時にPENDINGとし、終了メタデータ保存後にFINALIZINGへ更新する。
+送信済みバッチの分析完了後、終了時刻までの分析結果を確定できた場合だけCOMPLETEDとする。
+DLQへの移動等で未処理バッチが残ったまま分析完了待ちがタイムアウトした場合、
+または確定処理が失敗した場合はFAILEDとする。
+`collectionStatus=COMPLETED`だけではSQSの消化やAnalyzerの分析完了を保証せず、
+確定済み結果の判定には`analysisStatus=COMPLETED`を使用する。
 
 配信自体の終了日時`streams.endedAt`と`collectionStoppedAt`は別の値として扱う。
 同じ終了要求の再実行で収集停止時刻を変更せず、終端状態をRUNNINGへ戻さない。
@@ -338,7 +346,29 @@ Step Functionsの失敗通知から`architecture.md`の6.5節に従って補完�
 
 ---
 
-### 4.8. Processed Comment Batch
+### 4.8. Collection Job Batch
+
+収集ジョブがSQSへの送信に成功し、Analyzerによる完了確認が必要なコメントバッチを表す。
+
+主な情報：
+
+- Collection Job ID
+- Batch ID
+- 登録日時
+
+`(collectionJobId, batchId)`を複合主キーとする。
+
+Data CollectorがSQSから送信成功応答を受け取った後、
+Step FunctionsはStream Metadata Lambdaを呼び出し、返却された`batchId`を冪等に登録する。
+同じページの再試行で同じ`batchId`が返された場合も重複行を作成しない。
+
+分析完了の判定では、対象収集ジョブの`collection_job_batches`すべてについて、
+同じ`batchId`が`processed_comment_batches`へ登録済みであることを確認する。
+コメントが0件で送信バッチが存在しない収集ジョブも、未処理バッチ0件として確定処理へ進める。
+
+---
+
+### 4.9. Processed Comment Batch
 
 Data Collectorの再実行およびSQSメッセージの重複配信による分析結果の二重更新を防止するため、
 処理済みのコメントバッチを管理する。
@@ -361,7 +391,7 @@ Analyzer Lambdaは分析結果を更新する際、
 
 ---
 
-### 4.9. Processed Comment
+### 4.10. Processed Comment
 
 再取得時にコメントバッチの構成が変わった場合も二重集計を防ぐため、
 `processed_comments`で処理済みコメントを管理する。
@@ -396,6 +426,8 @@ Channel
            ├──< Frequent Words
            │
            ├──< Collection Job
+           │       │
+           │       └──< Collection Job Batch
            │
            ├──< Processed Comment Batch
            │
@@ -470,7 +502,8 @@ Data Collector LambdaからAnalyzer Lambdaへコメントデータを受け渡�
 
 PoCでは、複数のコメントを1メッセージにまとめる方式を基本とする。
 
-各メッセージにはコメントバッチを一意に識別する`batchId`を含める。
+各メッセージには収集ジョブを識別する`collectionJobId`と、
+コメントバッチを一意に識別する`batchId`を含める。
 
 例：
 
@@ -478,6 +511,7 @@ PoCでは、複数のコメントを1メッセージにまとめる方式を基�
 {
   "batchId": "batch-v1-4e6b8ac84f87fe828dfc6fa7c2bd2cbc4efd017322d650913bcae10bec864ad6",
   "streamId": "stream-001",
+  "collectionJobId": "collection-job-001",
   "videoId": "youtube-video-id",
   "comments": [
     {
@@ -556,6 +590,7 @@ channels
            ├── comment_length_distribution
            ├── frequent_words
            ├── collection_jobs
+           ├── collection_job_batches
            ├── processed_comment_batches
            └── processed_comments
 ```
@@ -564,6 +599,9 @@ channels
 
 `processed_comment_batches`はRaw Dataそのものではなく、
 SQSメッセージの冪等処理を実現するための処理管理情報として保存する。
+
+`collection_job_batches`は送信成功済みバッチと分析完了済みバッチを突合し、
+終了後の分析確定を開始できるか判定するための処理管理情報として保存する。
 
 ---
 
@@ -659,6 +697,27 @@ Raw Dataから再分析する場合も`(streamId, commentId)`で重複を除く�
 実装時には、SQS送信後・Task結果返却前の失敗、分割送信の一部失敗、
 コメント集合の部分的な重複、同一バッチ・重複コメントの並行処理、
 Aurora Commit前後の失敗で集計値が二重加算されないことを検証する。
+
+#### 9.5.1. 分析完了判定と確定処理
+
+終了メタデータ保存後、Analysis Finalizerは対象収集ジョブについて、
+`collection_job_batches`に存在し、`processed_comment_batches`に存在しない`batchId`の件数を確認する。
+
+未処理バッチが1件以上ある場合は分析結果を確定せず、
+Step Functionsへ待機が必要であることを返す。
+未処理バッチが0件で、`streams.endedAt`が保存済みの場合だけ、
+以下を一つのAuroraトランザクションで実行する。
+
+1. `streams.startedAt`から`streams.endedAt`までの不足している0件区間を`comment_timeline`へ作成する
+2. 最初・最後の部分区間を含む各区間の`commentsPerMinute`を再計算する
+3. `stream_metrics.analysisEndAt`を`streams.endedAt`へ更新し、`averageCommentsPerMinute`を再計算する
+4. `collection_jobs.analysisStatus`をCOMPLETED、`analysisFinalizedAt`を確定処理時刻へ更新する
+
+確定処理は同じ収集ジョブに対して再実行可能な冪等処理とする。
+トランザクション失敗時はすべてRollbackし、`analysisStatus`をCOMPLETEDへ変更しない。
+DLQへの移動等で未処理バッチが残ったまま分析完了待ちがタイムアウトした場合、
+または確定処理の再試行上限到達時は、
+`analysisStatus`をFAILEDとして未確定であることを保持する。
 
 ---
 
@@ -923,8 +982,8 @@ Stream Insightでは安全性を考慮し、独自に7暦日を保存上限と�
 
 収集処理の再実行や障害発生時の調査に利用する。
 
-`processed_comment_batches`および`processed_comments`は、
-再実行・再配信による重複集計を防止するための処理管理情報として保存する。
+`collection_job_batches`、`processed_comment_batches`および`processed_comments`は、
+分析完了確認と、再実行・再配信による重複集計防止のための処理管理情報として保存する。
 
 同じ分析結果へ再投入できる期間中は、処理済み情報だけを先に削除しない。
 削除する場合は収集を停止し、実行中のTask、SQS、DLQ、手動再投入からの再処理を停止したうえで、
