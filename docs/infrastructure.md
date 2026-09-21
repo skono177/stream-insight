@@ -22,24 +22,25 @@ AWSリソースはAWS CDKで管理する。
 
 PoCでは以下のAWSサービスを利用する。
 
-| 用途                  | AWSサービス                            |
-| --------------------- | -------------------------------------- |
-| フロントエンド配信    | Amazon S3                              |
-| CDN / APIルーティング | Amazon CloudFront                      |
-| REST API              | Amazon API Gateway                     |
-| API処理               | AWS Lambda                             |
-| データ収集            | AWS Lambda                             |
-| 配信メタデータ保存    | AWS Lambda                             |
-| コメント収集制御      | AWS Step Functions                     |
-| コメント分析          | AWS Lambda                             |
-| 非同期処理            | Amazon SQS                             |
-| Raw Data保存          | Amazon S3                              |
-| 分析結果保存          | Amazon Aurora Serverless v2 PostgreSQL |
-| API Key管理           | AWS Systems Manager Parameter Store    |
-| OAuth認証情報管理     | AWS Secrets Manager                    |
-| ログ・監視            | Amazon CloudWatch                      |
-| コスト監視            | AWS Budgets                            |
-| IaC                   | AWS CDK                                |
+| 用途                        | AWSサービス                            |
+| --------------------------- | -------------------------------------- |
+| フロントエンド配信          | Amazon S3                              |
+| CDN / APIルーティング       | Amazon CloudFront                      |
+| REST API                    | Amazon API Gateway                     |
+| API処理                     | AWS Lambda                             |
+| データ収集                  | AWS Lambda                             |
+| 配信メタデータ保存          | AWS Lambda                             |
+| コメント収集制御            | AWS Step Functions                     |
+| コメント分析                | AWS Lambda                             |
+| 非同期処理                  | Amazon SQS                             |
+| Raw Data保存                | Amazon S3                              |
+| 分析結果保存                | Amazon Aurora Serverless v2 PostgreSQL |
+| API Key管理                 | AWS Systems Manager Parameter Store    |
+| OAuth・DB管理者認証情報管理 | AWS Secrets Manager                    |
+| DBスキーマ適用              | Amazon RDS Data API                    |
+| ログ・監視                  | Amazon CloudWatch                      |
+| コスト監視                  | AWS Budgets                            |
+| IaC                         | AWS CDK                                |
 
 ---
 
@@ -212,6 +213,13 @@ VPC内
 ├── API Lambda
 ├── Aurora PostgreSQL
 └── S3 Gateway VPC Endpoint
+
+VPC外
+└── Migration Lambda
+      ↓ HTTPS
+    RDS Data API
+      ↓
+    Aurora PostgreSQL
 ```
 
 Data Collector LambdaはAuroraへ直接接続しない。
@@ -263,6 +271,16 @@ Analyzer Lambdaが配置されるPrivate SubnetのRoute Tableに関連付ける�
 Endpoint PolicyおよびRaw Data S3のBucket Policyでは、
 Analyzer LambdaによるRaw Data保存に必要なアクセスのみを許可する。
 
+Stream Metadata Lambda、Analyzer LambdaおよびAPI LambdaはIAM DB認証を利用し、
+Aurora管理者Secretへアクセスしない。
+IAM認証トークンはLambda実行Roleの一時認証情報を使って実行環境内で署名生成するため、
+トークン生成のためのSecrets Manager、RDS API、STSへの実行時通信は行わない。
+
+DBスキーマ適用用のMigration LambdaはVPC外へ配置し、
+HTTPSのRDS Data APIからAuroraへSQLを実行する。
+Migration Lambda自身はAuroraのPrivate EndpointやSecrets Manager APIへ直接接続しないため、
+Migration用のNAT GatewayおよびInterface VPC Endpointは作成しない。
+
 VPC内コンポーネントが実行時にアクセスするAWSサービスについては、
 インターネット接続またはVPC Endpointが必要かを確認し、
 NAT Gatewayを使用せずに必要な通信経路を確保する。
@@ -273,10 +291,11 @@ PoC時点の主な通信経路は以下とする。
 | ---------------------- | --------------------------------------- | ----------------------- |
 | Data Collector Lambda  | YouTube Data API                        | VPC外からインターネット |
 | Data Collector Lambda  | SQS / Parameter Store / Secrets Manager | VPC外からAWSサービス    |
-| Stream Metadata Lambda | Aurora PostgreSQL                       | VPC内                   |
-| Analyzer Lambda        | Aurora PostgreSQL                       | VPC内                   |
+| Stream Metadata Lambda | Aurora PostgreSQL Writer Endpoint       | VPC内、TCP 5432         |
+| Analyzer Lambda        | Aurora PostgreSQL Writer Endpoint       | VPC内、TCP 5432         |
 | Analyzer Lambda        | Raw Data S3                             | S3 Gateway VPC Endpoint |
-| API Lambda             | Aurora PostgreSQL                       | VPC内                   |
+| API Lambda             | Aurora PostgreSQL Cluster Endpoint      | VPC内、TCP 5432         |
+| Migration Lambda       | RDS Data API / Aurora管理者Secret       | VPC外からAWSサービス    |
 
 新たにVPC内Lambdaから他のAWSサービスへアクセスする必要が生じた場合は、
 対象サービスのVPC Endpoint追加を検討する。
@@ -730,7 +749,109 @@ Stream Metadata Lambda、API LambdaおよびAnalyzer Lambdaからのアクセス
 
 ---
 
-### 10.2. キャパシティ
+### 10.2. 認証・接続
+
+Aurora PostgreSQLではIAM DB認証を有効化する。
+
+アプリケーション実行時に接続するLambdaごとに、以下のDBユーザーを作成する。
+
+| Lambda                 | DBユーザー             | DB権限                                                                                                  |
+| ---------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------- |
+| Stream Metadata Lambda | `stream_metadata_user` | `channels`、`streams`、`collection_jobs`への必要なSELECT / INSERT / UPDATE、および採番用SequenceのUSAGE |
+| Analyzer Lambda        | `analyzer_user`        | 分析結果・処理済み管理テーブルへの必要なSELECT / INSERT / UPDATE、および採番用SequenceのUSAGE           |
+| API Lambda             | `api_readonly_user`    | APIが参照するテーブルへのSELECTのみ                                                                     |
+
+各ユーザーにはPostgreSQLの`rds_iam`ロールを付与する。
+アプリケーションLambdaへ管理者権限、DDL権限、他コンポーネント用テーブルへの不要な権限を付与しない。
+
+各Lambdaの実行Roleには、自身のDBユーザーだけを対象とする
+`rds-db:connect`を許可する。
+
+```text
+arn:aws:rds-db:<region>:<account-id>:dbuser:<cluster-resource-id>/<db-user-name>
+```
+
+IAM PolicyのリソースにはCluster ARNではなく、
+Aurora DB Cluster Resource IDとDBユーザー名を使用する。
+ワイルドカードのDBユーザー指定は行わない。
+
+Lambdaは接続を新規作成する直前にAWS SDKでIAM認証トークンを生成し、
+そのトークンをPostgreSQLのパスワードとして使用する。
+トークンの有効期間は15分であり、環境変数、ログ、Secrets Manager、Parameter Storeには保存しない。
+失敗時のログにもトークンおよび接続文字列を出力しない。
+
+IAM認証トークンの生成は署名処理であり、RDS APIへの通信を必要としない。
+Lambda実行環境に提供される実行Roleの一時認証情報を使用するため、
+アプリケーションLambda用のSecrets Manager VPC EndpointおよびNAT Gatewayは不要とする。
+
+DB接続ではTLSを必須とし、AWSが提供するRDS CA bundleで証明書とホスト名を検証する。
+証明書検証を無効化しない。
+以下はシークレットではない接続設定としてLambda環境変数へ設定する。
+
+```text
+DB_HOST=<Aurora cluster endpoint>
+DB_PORT=5432
+DB_NAME=stream_insight
+DB_USER=<LambdaごとのDBユーザー>
+AWS_REGION=<deployment region>
+```
+
+認証トークンはDBホスト名・ポート・ユーザー名・Regionに対して生成し、
+接続設定と同じ値を使用する。
+新しい物理接続ごとに新しいトークンを生成する。
+既存接続の再利用は可能だが、期限切れトークンを新規接続へ再利用しない。
+接続プールには上限を設定し、Lambdaの同時実行数と合わせてAuroraの最大接続数を超えないようにする。
+
+Security Groupは、Stream Metadata Lambda、Analyzer LambdaおよびAPI Lambdaから
+AuroraのTCP 5432への通信だけを許可する。
+AuroraはPublic Accessを無効化し、インターネットからの接続を許可しない。
+
+### 10.3. DBユーザー作成・スキーマ適用
+
+Aurora Serverless v2ではRDS Data APIを有効化する。
+
+Auroraの管理者パスワードはCDKで自動生成し、
+Auroraが管理するSecrets Manager Secretとして保存する。
+Secret名は以下を基本とする。
+
+```text
+stream-insight/dev/aurora/admin
+```
+
+管理者SecretはアプリケーションLambdaへ付与しない。
+VPC外のMigration Lambdaだけが、RDS Data API実行時の`secretArn`として使用する。
+
+Migration Lambdaはデプロイ時のCustom Resourceから呼び出し、
+RDS Data APIのトランザクションおよびSQL実行APIを利用して、以下を冪等に実行する。
+
+- テーブル、インデックスおよび制約の作成・更新
+- `stream_metadata_user`、`analyzer_user`、`api_readonly_user`の作成
+- 各DBユーザーへの`rds_iam`付与
+- 各DBユーザーへの最小限のテーブル・シーケンス権限付与
+- 不要な`PUBLIC`権限の取消し
+
+Migration Lambdaの実行Roleには対象管理者Secretへの
+`secretsmanager:GetSecretValue`、対象Clusterへの`rds-data:BeginTransaction`、
+`rds-data:ExecuteStatement`、`rds-data:BatchExecuteStatement`、
+`rds-data:CommitTransaction`および`rds-data:RollbackTransaction`を付与する。
+Secretでカスタマー管理KMS Keyを使用する場合は、対象Keyへの`kms:Decrypt`も付与する。
+Migration Lambdaは`rds-db:connect`を使用せず、
+Auroraへ直接接続するためのSecurity GroupやDBドライバーも使用しない。
+
+Migration LambdaおよびCustom Resourceのログには、
+Secret値、DBパスワード、IAM認証トークン、完全な接続文字列を出力しない。
+Migration成功後にアプリケーションLambdaを利用可能とする依存関係をCDKで設定する。
+Migration失敗時はデプロイを失敗させ、アプリケーションを不完全なスキーマで稼働させない。
+
+Data APIを利用できるAurora PostgreSQLのEngine VersionをCDKで明示し、
+デプロイ対象Regionで利用可能であることを事前に確認する。
+
+管理者Secretの自動ローテーションはPoCでは必須としない。
+ローテーションを追加する場合は、利用する方式に応じて必要な通信経路を別途設計する。
+
+---
+
+### 10.4. キャパシティ
 
 PoCでは可能な限り小さいキャパシティ設定から開始する。
 
@@ -994,6 +1115,17 @@ Access Tokenを取得できない場合は、
 
 PoCではOAuth 2.0認可画面および認可管理用Web UIは実装しない。
 
+### 13.3. Aurora PostgreSQL
+
+アプリケーションLambdaはIAM DB認証を使用するため、
+DBパスワードを保持・取得しない。
+
+Aurora管理者資格情報だけをSecrets Managerで管理し、
+DBユーザー作成およびスキーマ適用を行うMigration Lambdaからのみ利用する。
+Migration LambdaはVPC外からRDS Data APIを呼び出すため、
+Secrets Manager Interface VPC Endpointは作成しない。
+詳細は10.2節および10.3節に定義する。
+
 ---
 
 ## 14. IAM
@@ -1012,7 +1144,8 @@ CloudWatch Logs
 ### Stream Metadata Lambda
 
 ```text
-Aurora Access
+rds-db:connect
+Resource: arn:aws:rds-db:<region>:<account-id>:dbuser:<cluster-resource-id>/stream_metadata_user
 CloudWatch Logs
 ```
 
@@ -1022,16 +1155,37 @@ CloudWatch Logs
 SQS ReceiveMessage
 SQS DeleteMessage
 S3 PutObject
-Aurora Access
+rds-db:connect
+Resource: arn:aws:rds-db:<region>:<account-id>:dbuser:<cluster-resource-id>/analyzer_user
 CloudWatch Logs
 ```
 
 ### API Lambda
 
 ```text
-Aurora Access
+rds-db:connect
+Resource: arn:aws:rds-db:<region>:<account-id>:dbuser:<cluster-resource-id>/api_readonly_user
 CloudWatch Logs
 ```
+
+### Migration Lambda
+
+```text
+rds-data:BeginTransaction
+rds-data:ExecuteStatement
+rds-data:BatchExecuteStatement
+rds-data:CommitTransaction
+rds-data:RollbackTransaction
+Resource: <Aurora cluster ARN>
+secretsmanager:GetSecretValue
+Resource: <stream-insight/dev/aurora/admin Secret ARN>
+KMS Decrypt（カスタマー管理KMS Keyを使用する場合のみ）
+CloudWatch Logs
+```
+
+`rds-db:connect`のResourceはLambdaごとのDBユーザーへ限定する。
+Migration Lambda以外のアプリケーションLambdaには、
+Aurora管理者Secretへのアクセスを許可しない。
 
 ### Step Functions
 
@@ -1234,7 +1388,9 @@ PoCでは以下のStack構成を基本とする。
 管理対象：
 
 - Raw Data S3
-- Aurora Serverless v2
+- Aurora Serverless v2（IAM DB認証およびRDS Data API有効）
+- Aurora管理者Secret
+- Aurora Security Group
 
 ### BackendStack
 
@@ -1243,6 +1399,7 @@ PoCでは以下のStack構成を基本とする。
 - SQS
 - DLQ
 - Data Collector Lambda
+- VPC外のMigration Lambda / Custom Resource
 - Stream Metadata Lambda
 - Analyzer Lambda
 - API Lambda
@@ -1253,7 +1410,8 @@ PoCでは以下のStack構成を基本とする。
 - API Gateway Access Log Group
 - Step Functions Log Group
 - Parameter Store
-- Secrets Manager
+- YouTube OAuth用Secrets Manager Secret
+- Lambda実行RoleおよびDBユーザー単位の`rds-db:connect` Policy
 - CloudWatch Alarm
 - AWS Budget
 
@@ -1354,6 +1512,8 @@ PoCでは以下を重視する。
 - Raw Dataを7日で削除する
 - NAT Gatewayを原則として使用しない
 - S3アクセスにはGateway VPC Endpointを利用する
+- DB実行時認証にはIAM DB認証を利用し、アプリケーションLambdaへDBパスワードを配布しない
+- DBスキーマ適用にはRDS Data APIを利用し、Migration用Interface VPC Endpointの固定費を発生させない
 - API GatewayにThrottlingを設定する
 - API LambdaにReserved Concurrencyを設定する
 - AWS Budgetsでコストを監視する
