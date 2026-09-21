@@ -322,6 +322,13 @@ GET /api/streams/{streamId}/metrics
 `[startedAt, analysisEndAt)`に含まれる総コメント数を同期間の分数で除して算出する。
 配信終了後の確定値では`analysisEndAt`に実終了日時を使用する。
 配信中の値は`analysisEndAt`時点の暫定値とする。
+
+`averageCommentLength`は、Raw Dataの元のコメント本文を
+Unicode 15.1.0のUnicode Standard Annex #29で定義される
+拡張書記素クラスタ単位で数えた文字数の合計を、`totalComments`で除して算出する。
+空文字は文字数`0`として分母に含め、`totalComments`が`0`の場合は`0`を返す。
+計算途中では丸めず、小数第1位へ四捨五入して返す。
+
 `analysisStatus`はPENDING / FINALIZING / COMPLETED / FAILEDのいずれかを返す。
 終了後の確定値として扱えるのはCOMPLETEDの場合だけとする。
 
@@ -410,6 +417,11 @@ GET /api/streams/{streamId}/length-distribution
   "streamId": "stream-001",
   "items": [
     {
+      "minLength": 0,
+      "maxLength": 0,
+      "count": 0
+    },
+    {
       "minLength": 1,
       "maxLength": 10,
       "count": 1200
@@ -432,6 +444,15 @@ GET /api/streams/{streamId}/length-distribution
   ]
 }
 ```
+
+分布区間は`0`、`1 - 10`、`11 - 20`、`21 - 30`、`31以上`の5区間に固定し、
+該当コメントが0件の区間も省略せず返す。
+`minLength`と`maxLength`はともに境界値を含み、`maxLength = null`は上限なしを表す。
+
+文字数はRaw Dataの元のコメント本文を対象に、Unicode 15.1.0の
+Unicode Standard Annex #29で定義される拡張書記素クラスタ単位で算出する。
+算出前のUnicode正規化、小文字化、前後空白の除去、改行・URL等の除去は行わない。
+空文字は`0`文字として扱う。
 
 ---
 
