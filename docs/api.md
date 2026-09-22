@@ -370,10 +370,10 @@ GET /api/streams/{streamId}/timeline
   "analysisStatus": "PENDING",
   "items": [
     {
-      "startAt": "2026-08-23T15:00:00Z",
+      "startAt": "2026-08-23T15:00:20Z",
       "endAt": "2026-08-23T15:01:00Z",
       "commentCount": 120,
-      "commentsPerMinute": 120
+      "commentsPerMinute": 180
     },
     {
       "startAt": "2026-08-23T15:01:00Z",
@@ -427,6 +427,9 @@ GET /api/streams/{streamId}/length-distribution
 ```json
 {
   "streamId": "stream-001",
+  "analysisStartAt": "2026-08-23T15:00:20Z",
+  "analysisEndAt": "2026-08-23T17:00:00Z",
+  "analysisStatus": "COMPLETED",
   "items": [
     {
       "minLength": 0,
@@ -465,6 +468,8 @@ GET /api/streams/{streamId}/length-distribution
 Unicode Standard Annex #29で定義される拡張書記素クラスタ単位で算出する。
 算出前のUnicode正規化、小文字化、前後空白の除去、改行・URL等の除去は行わない。
 空文字は`0`文字として扱う。
+`analysisStartAt`、`analysisEndAt`、`analysisStatus`は配信メトリクスおよび
+タイムラインと同じ値を返す。COMPLETED以外の分布は暫定値として扱う。
 
 ---
 
@@ -497,6 +502,9 @@ GET /api/streams/{streamId}/frequent-words
 ```json
 {
   "streamId": "stream-001",
+  "analysisStartAt": "2026-08-23T15:00:20Z",
+  "analysisEndAt": "2026-08-23T17:00:00Z",
+  "analysisStatus": "COMPLETED",
   "items": [
     {
       "rank": 1,
@@ -516,6 +524,9 @@ GET /api/streams/{streamId}/frequent-words
   ]
 }
 ```
+
+`analysisStartAt`、`analysisEndAt`、`analysisStatus`は配信メトリクスおよび
+タイムラインと同じ値を返す。COMPLETED以外の頻出ワードは暫定値として扱う。
 
 ---
 

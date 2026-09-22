@@ -402,6 +402,10 @@ YouTubeからのデータ収集処理を管理するための情報を表す。
 | `analysisFinalizedAt` | Analysis Finalizerが終了後の分析結果を確定した日時                                |
 
 開始時にRUNNINGで登録する。
+PoCでは`collection_jobs.streamId`に一意制約を設け、1配信に複数の収集ジョブを作らない。
+同じExecution ARNの再試行は既存ジョブを更新し、別Executionによる同じ配信の収集開始は
+FAILEDジョブが残る場合を含めて拒否する。配信単位の集計と処理済み情報を再利用した
+再収集はPoC対象外とし、将来必要になった時点でジョブ単位のデータ分離を設計する。
 `observationStartedAt`は、Data Collectorが初回のコメント取得要求を送る直前に候補値を確定し、
 その要求が正常終了した場合に保存する。失敗した要求の開始日時は採用しない。
 初回レスポンスに`observationStartedAt`より前のコメントが含まれても分析対象には含めない。
@@ -837,7 +841,9 @@ Step Functionsへ待機が必要であることを返す。
 トランザクション失敗時はすべてRollbackし、`analysisStatus`をCOMPLETEDへ変更しない。
 DLQへの移動等で未処理バッチが残ったまま分析完了待ちがタイムアウトした場合、
 または確定処理の再試行上限到達時は、
-`analysisStatus`をFAILEDとして未確定であることを保持する。
+Stream Metadata Lambdaの失敗状態更新モードで`analysisStatus`をFAILEDへ冪等に更新し、
+未確定であることを保持する。既にCOMPLETEDのジョブはFAILEDへ戻さない。
+Aurora障害で更新できない場合は復旧後に同じジョブへ反映する。
 
 ---
 

@@ -336,6 +336,13 @@ Aurora PostgreSQLへ永続化する。
 開始時にStep Functions Execution ARNを一意キーとして`collection_jobs`を登録し、
 終了時は同じ実行のレコードを更新する。
 
+PoCでは1配信につき収集ジョブを1件に限定する。
+`collection_jobs.streamId`にも一意制約を設定し、既存ジョブがある配信への別Executionの開始は
+状態がFAILEDであっても拒否する。同じExecution ARNの再試行は既存ジョブを再利用する。
+これにより配信単位の集計・処理済み情報と別ジョブのバッチが混在しない。
+開始登録は配信情報の作成・更新と同一トランザクションで行い、一意制約違反時は開始を失敗させる。
+同一配信の再収集を可能にする場合は、ジョブ単位の集計・重複排除・確定条件を別途設計する。
+
 コメントバッチの登録はSQS送信前に行い、同じ登録要求の再実行では既存行を返す。
 同じ`collectionJobId`と`batchId`に異なるオブジェクトキーまたはPayload SHA-256が指定された場合は、
 既存行を上書きせずエラーとする。
@@ -557,6 +564,10 @@ Analysis Finalizerは`collection_jobs.collectionStatus=COMPLETED`の場合だけ
 
 確定処理は一つのAuroraトランザクションで冪等に実行する。
 未処理バッチが残っている場合は更新せず、Step FunctionsへPENDINGを返す。
+FinalizerのRetry上限到達時はStep FunctionsのCatchからStream Metadata Lambdaの
+失敗状態更新モードを呼び出し、対象`collectionJobId`の`analysisStatus=FAILED`を冪等に保存する。
+この更新はFinalizerとは別のTaskとして再試行する。
+既にCOMPLETEDのジョブはFAILEDへ戻さない。
 
 ---
 
@@ -717,6 +728,7 @@ Analysis Finalizer Lambda
 未処理バッチあり？
    ├── Yes → Wait 10秒 → Analysis Finalizer Lambda
    └── No  → 分析結果確定 → End
+Finalizer失敗・待機上限 → 失敗状態更新（別Task）→ Fail
 ```
 
 Step Functionsは`streams.endedAt`および収集終了状態の保存後、
@@ -735,8 +747,11 @@ Analysis Finalizerは、SQS送信前に対象`collectionJobId`の`collection_job
 同じ確定要求の再実行では確定済み結果を重複更新しない。
 
 DLQへの移動等で未処理バッチが残ったまま待機開始から30分を超えた場合、
-または確定処理の再試行上限へ到達した場合は`analysisStatus=FAILED`としてFailへ遷移し、
+または確定処理の再試行上限へ到達した場合は、Stream Metadata Lambdaによる
+`analysisStatus=FAILED`の保存を再試行してからFailへ遷移し、
 未確定の結果を確定済みとして公開しない。
+Aurora障害により失敗状態を保存できない場合はExecutionを失敗させて通知し、
+6.5節の終了状態復旧手順で元のジョブへFAILEDを反映する。
 
 ---
 
@@ -863,6 +878,9 @@ DB障害時に収集状態まで保存できたとは扱わない。
 コメント収集を行わない終了処理専用の実行からメタデータ再取得・保存を再実行する。
 更新対象は元のCollection Jobとし、復旧実行のARNで別の収集ジョブを作らない。
 収集失敗履歴は保持し、欠けていた実終了日時だけを補完できるようにする。
+Finalizer失敗後に`analysisStatus=FINALIZING`が残った場合も、
+同じExecution ARNと`collectionJobId`を指定して失敗状態更新モードを再実行し、
+`analysisStatus=FAILED`を保存する。収集は再開せず、分析結果も確定しない。
 手動停止・State Machine全体のタイムアウト等でCatchを実行できなかった場合も、この手順で補完する。
 
 実装時は、正常終了、実終了日時の反映遅延、Live Chatのみ終了、

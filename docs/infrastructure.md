@@ -372,6 +372,8 @@ Data Collectorを送信モードで呼び出す。
 - `streams`の作成・更新
 - 終了時の最終メタデータ（`endedAt`を含む）更新
 - Execution ARNを一意キーとする`collection_jobs`の開始登録・終了状態更新
+- `collection_jobs.streamId`の一意制約による別Executionの重複開始拒否
+- Finalizer失敗時の`analysisStatus=FAILED`を記録する失敗状態更新モード
 - 収集成功時の`analysisStatus=FINALIZING`、収集失敗時の`analysisStatus=FAILED`への更新
 - `collection_jobs.observationStartedAt`および`stream_metrics.analysisStartAt`の初回保存
 - SQS送信前の`batchId`、Outboxオブジェクトキー、Payload SHA-256の`collection_job_batches`への冪等登録
@@ -483,6 +485,8 @@ Step Functionsから配信終了後に呼び出す。
 `analysisEndAt`の更新および`analysisStatus=COMPLETED`への更新を行わない。
 収集失敗時はStream Metadata Lambdaが`analysisStatus=FAILED`を保存し、
 Step FunctionsはAnalysis Finalizerを呼び出さずExecutionを失敗させる。
+Finalizer自身のRetry上限到達時も、Step FunctionsのCatchから
+Stream Metadata Lambdaの失敗状態更新モードを別Taskとして再試行する。
 
 Auroraへ接続するためVPC内へ配置し、Reserved Concurrencyは1とする。
 1実行につき物理接続を最大1本とし、実行終了前に閉じる。
@@ -658,7 +662,9 @@ DB保存は初回を含め最大4回、2秒・4秒・8秒のBackoffで再試行�
 分析完了確認は10秒間隔で行い、待機開始から30分を上限とする。
 DLQへの移動等で未処理バッチが残ったまま上限へ到達した場合、
 または確定処理のRetry上限到達時は、
-`analysisStatus=FAILED`を保存してState Machine Executionを失敗させる。
+Stream Metadata Lambdaによる`analysisStatus=FAILED`の保存を再試行してから
+State Machine Executionを失敗させる。Aurora障害で保存できない場合も
+Execution失敗を通知し、`architecture.md`の6.5節の復旧手順で同じジョブへ反映する。
 終了時の再試行・復旧手順は`architecture.md`の6.5節に従う。
 
 ---
