@@ -109,6 +109,7 @@ dist
 
 # Serverless directories
 .serverless/
+cdk.out/
 
 # FuseBox cache
 .fusebox/
