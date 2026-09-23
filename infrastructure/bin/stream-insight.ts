@@ -19,7 +19,12 @@ Tags.of(app).add('Project', 'stream-insight');
 Tags.of(app).add('Environment', environment);
 Tags.of(app).add('ManagedBy', 'cdk');
 
-new NetworkStack(app, `stream-insight-${environment}-network`, { env: awsEnvironment });
-new StorageStack(app, `stream-insight-${environment}-storage`, { env: awsEnvironment });
+const networkStack = new NetworkStack(app, `stream-insight-${environment}-network`, {
+  env: awsEnvironment,
+});
+new StorageStack(app, `stream-insight-${environment}-storage`, {
+  env: awsEnvironment,
+  vpc: networkStack.vpc,
+});
 new BackendStack(app, `stream-insight-${environment}-backend`, { env: awsEnvironment });
 new FrontendStack(app, `stream-insight-${environment}-frontend`, { env: awsEnvironment });
