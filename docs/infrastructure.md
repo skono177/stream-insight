@@ -894,7 +894,10 @@ Stream Metadata Lambda、Analyzer Lambda、Analysis Finalizer LambdaおよびAPI
 
 Aurora PostgreSQLではIAM DB認証を有効化する。
 
-アプリケーション実行時に接続するLambdaごとに、以下のDBユーザーを作成する。
+アプリケーション実行時に接続するLambdaごとに、以下のDBユーザーを使用する。
+これらのユーザー作成、`rds_iam`付与、Table / Sequence権限および
+実行Roleへの`rds-db:connect`付与はIssue #11では行わず、
+後続の各Application Lambda実装Issueで接続方式と合わせて設計・実装する。
 
 | Lambda                    | DBユーザー               | DB権限                                                                                                                        |
 | ------------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
@@ -903,10 +906,10 @@ Aurora PostgreSQLではIAM DB認証を有効化する。
 | Analysis Finalizer Lambda | `analysis_finalizer_user` | 送信・処理済みバッチのSELECT、分析結果・`collection_jobs`への必要なSELECT / INSERT / UPDATE                               |
 | API Lambda                | `api_readonly_user`      | APIが参照するテーブルへのSELECTのみ                                                                                           |
 
-各ユーザーにはPostgreSQLの`rds_iam`ロールを付与する。
+各ユーザーには、後続IssueでPostgreSQLの`rds_iam`ロールを付与する。
 アプリケーションLambdaへ管理者権限、DDL権限、他コンポーネント用テーブルへの不要な権限を付与しない。
 
-各Lambdaの実行Roleには、自身のDBユーザーだけを対象とする
+後続Issueでは、各Lambdaの実行Roleに自身のDBユーザーだけを対象とする
 `rds-db:connect`を許可する。
 
 ```text
@@ -950,7 +953,7 @@ Security Groupは、Stream Metadata Lambda、Analyzer Lambda、Analysis Finalize
 AuroraのTCP 5432への通信だけを許可する。
 AuroraはPublic Accessを無効化し、インターネットからの接続を許可しない。
 
-### 10.3. DBユーザー作成・スキーマ適用
+### 10.3. DBスキーマ適用・DBユーザー責務
 
 Aurora Serverless v2ではRDS Data APIを有効化する。
 
@@ -965,27 +968,221 @@ stream-insight/dev/aurora/admin
 管理者SecretはアプリケーションLambdaへ付与しない。
 VPC外のMigration Lambdaだけが、RDS Data API実行時の`secretArn`として使用する。
 
-Migration Lambdaはデプロイ時のCustom Resourceから呼び出し、
-RDS Data APIのトランザクションおよびSQL実行APIを利用して、以下を冪等に実行する。
+#### 10.3.1. Migration Lambda
 
-- テーブル、インデックスおよび制約の作成・更新
-- `stream_metadata_user`、`analyzer_user`、`analysis_finalizer_user`、`api_readonly_user`の作成
-- 各DBユーザーへの`rds_iam`付与
-- 各DBユーザーへの最小限のテーブル・シーケンス権限付与
-- 不要な`PUBLIC`権限の取消し
+Migration LambdaはBackendStackで管理し、VPC外へ配置する。
+Database Nameは`stream_insight`とし、AuroraへのSQL実行にはHTTPSのRDS Data APIを使用する。
+AuroraへTCP 5432で直接接続せず、PostgreSQL Driver、VPC attachment、SubnetおよびSecurity Groupを使用しない。
 
-Migration Lambdaの実行Roleには対象管理者Secretへの
-`secretsmanager:GetSecretValue`、対象Clusterへの`rds-data:BeginTransaction`、
-`rds-data:ExecuteStatement`、`rds-data:BatchExecuteStatement`、
-`rds-data:CommitTransaction`および`rds-data:RollbackTransaction`を付与する。
-Secretでカスタマー管理KMS Keyを使用する場合は、対象Keyへの`kms:Decrypt`も付与する。
-Migration Lambdaは`rds-db:connect`を使用せず、
-Auroraへ直接接続するためのSecurity GroupやDBドライバーも使用しない。
+実装言語およびPackaging方式は以下とする。
 
-Migration LambdaおよびCustom Resourceのログには、
-Secret値、DBパスワード、IAM認証トークン、完全な接続文字列を出力しない。
+| 項目 | 方針 |
+| --- | --- |
+| Language | TypeScript |
+| Runtime | Node.js 24.x |
+| SDK | AWS SDK for JavaScript v3、`@aws-sdk/client-rds-data` |
+| CDK Construct | `NodejsFunction` |
+| Bundler | esbuild |
+| SQL | Lambda assetへ同梱 |
+| Memory | 256 MB |
+| Timeout | 5分 |
+| Reserved Concurrency | 1 |
+
+Reserved Concurrencyだけを排他制御の唯一の保証とはせず、
+`schema_migrations.version`のPrimary KeyおよびTransaction-level Advisory Lockと組み合わせる。
+
+#### 10.3.2. 実行方式
+
+Migration LambdaをService TokenとするLambda-backed CDK Custom Resourceを使用する。
+
+- Create時はMigrationを実行する
+- Update時はMigration bundleが変更された場合に実行する
+- Delete時はDB Objectを削除せずno-opで成功を返す
+- Migration失敗時はStack Deploymentを失敗させる
+- `cdk synth`ではMigrationを実行しない
+
 Migration成功後にアプリケーションLambdaを利用可能とする依存関係をCDKで設定する。
-Migration失敗時はデプロイを失敗させ、アプリケーションを不完全なスキーマで稼働させない。
+
+#### 10.3.3. Version SQL
+
+Migrationは複数Version方式とする。
+
+```text
+migrations/
+├── 001_initial_schema/
+│   ├── 001_xxx.sql
+│   └── 002_xxx.sql
+└── 002_add_xxx/
+    └── 001_xxx.sql
+```
+
+- 1 Migration Versionを1 Transactionで適用する
+- 1 SQL Fileを1 Data API Statementとして実行する
+- Version内のSQLはファイル名順に実行する
+- Versionは数値昇順で適用する
+- 適用済みVersionはskipする
+- 適用済みVersionのChecksum一致を確認する
+- Checksum不一致はdriftとして失敗させる
+- Version適用成功後、同じTransaction内で`schema_migrations`へ履歴を登録する
+- SQL失敗時はTransactionをRollbackする
+- Application Table等のDDLには原則として`IF NOT EXISTS`を付けない
+- `schema_migrations`のbootstrapに限り`IF NOT EXISTS`を使用できる
+
+RDS Data APIは一度の`ExecuteStatement`で複数SQL文を実行しない。
+SQL Fileを`;`で単純分割する方式は、String Literal、Comment、Dollar Quoteおよび
+PostgreSQL Function等を正しく扱えないため採用しない。
+今回のMigration DDLでは`BatchExecuteStatement`を使用しない。
+
+初期Migrationでは`data-model.md`に定義する以下の10 Application Tableをすべて作成する。
+
+- `channels`
+- `streams`
+- `stream_metrics`
+- `comment_timeline`
+- `comment_length_distribution`
+- `frequent_words`
+- `collection_jobs`
+- `collection_job_batches`
+- `processed_comment_batches`
+- `processed_comments`
+
+これらに加え、Migration管理用の`schema_migrations`を利用する。
+
+#### 10.3.4. Transaction
+
+1 Migration Versionを1 Transactionとし、概念的に以下の順序で処理する。
+
+```text
+schema_migrations bootstrap
+  ↓
+適用済みVersion取得 / Checksum確認
+  ↓
+BeginTransaction
+  ↓
+Transaction-level Advisory Lock取得
+  ↓
+Lock取得後にVersion履歴を再確認
+  ↓
+Version内SQLをファイル順にExecuteStatement
+  ↓
+schema_migrationsへ履歴INSERT
+  ↓
+CommitTransaction
+```
+
+途中で失敗した場合は`RollbackTransaction`を実行する。
+
+#### 10.3.5. Advisory Lock
+
+Migrationの同時実行制御にはSession-level LockではなくTransaction-level Advisory Lockを使用する。
+実装では`pg_try_advisory_xact_lock`を使用し、取得できなかった場合は短いBackoff後に
+対象VersionのTransaction全体を再試行する。
+LockはTransactionのCommitまたはRollbackによって自動的に解放される。
+
+固定Lock Keyは以下とする。
+
+```text
+760466283874603037
+```
+
+この値は単なるマジックナンバーではなく、以下の名前空間文字列のSHA-256先頭64 bitから導出した値である。
+
+```text
+stream-insight:stream_insight:schema-migration:v1
+```
+
+#### 10.3.6. RDS Data API / IAM
+
+Migration Lambdaは以下のRDS Data API操作だけを使用する。
+
+- `BeginTransaction`
+- `ExecuteStatement`
+- `CommitTransaction`
+- `RollbackTransaction`
+
+実行Roleには以下の最小権限を設定する。
+
+| Action | Resource |
+| --- | --- |
+| `rds-data:BeginTransaction` | 対象Aurora Cluster ARN |
+| `rds-data:ExecuteStatement` | 対象Aurora Cluster ARN |
+| `rds-data:CommitTransaction` | 対象Aurora Cluster ARN |
+| `rds-data:RollbackTransaction` | 対象Aurora Cluster ARN |
+| `secretsmanager:GetSecretValue` | 対象Aurora管理者Secret ARN |
+
+以下は付与しない。
+
+- `rds-data:BatchExecuteStatement`
+- `rds-db:connect`
+- Resource `*`
+- Migration用途の追加KMS権限（現状はCustomer Managed KMS Keyを使用しないため）
+
+`grantDataApiAccess()`等によって不要なActionが追加される場合は使用せず、
+明示的なPolicy Statementによって最小権限化する。
+
+#### 10.3.7. Network
+
+Migration LambdaはVPC外からHTTPSでRDS Data APIを呼び出す。
+このMigration方式のために以下を追加しない。
+
+- VPC attachment
+- Subnet
+- Security Group
+- Aurora Security GroupへのIngress Rule
+- NAT Gateway
+- Internet Gateway
+- Secrets Manager Interface VPC Endpoint
+- RDS Data API Interface VPC Endpoint
+- PostgreSQL TCP 5432接続
+
+#### 10.3.8. Aurora Auto-pause / Retry
+
+Aurora Serverless v2は最小0 ACU、Auto-pause 300秒であるため、
+Migration開始時にWriterがPauseしている可能性がある。
+
+- Transaction開始前に`SELECT 1`等のPreflightを実行する
+- `DatabaseResumingException`等の一時的エラーだけをRetryする
+- Exponential BackoffとJitterを使用し、Retry上限を設定する
+- SQL Syntax Error、AccessDenied、InvalidSecretおよびChecksum不一致等の非一時エラーはRetryしない
+
+具体的なRetry回数および待機時間は、Lambda Timeout 5分の範囲内で実装時に確定する。
+
+#### 10.3.9. Logging
+
+Migration Lambda用Log GroupはCDKで明示的に作成し、保持期間7日、Removal PolicyはDESTROYとする。
+
+ログへ以下を出力する。
+
+- Migration開始
+- 未適用Version
+- 対象VersionとChecksum
+- Version開始・成功・所要時間
+- Rollback成否
+- Migration完了
+- Error種別
+- AWS Request ID
+
+以下はログへ出力しない。
+
+- Secret内容
+- DB Password
+- Token
+- 接続文字列
+- SQL全文
+- Custom Resource Response URL
+- Raw Comment Data
+
+#### 10.3.10. Application DBユーザーの責務
+
+Issue #11の初期MigrationではApplication DBユーザーを作成しない。
+
+- `stream_metadata_user`、`analyzer_user`、`analysis_finalizer_user`および`api_readonly_user`を作成しない
+- `rds_iam`を付与しない
+- Application Lambda用のTable / Sequence権限をGRANTしない
+- Application Lambda用の`rds-db:connect` Policyを設定しない
+
+これらは後続の各Application Lambda実装Issueで、必要な権限および接続方式と合わせて設計・実装する。
+将来、DBユーザー作成をVersion Migrationで管理することは妨げないが、Issue #11のスコープ外とする。
 
 Data APIを利用できるAurora PostgreSQLのEngine VersionをCDKで明示し、
 デプロイ対象Regionで利用可能であることを事前に確認する。
@@ -1322,7 +1519,8 @@ PoCではOAuth 2.0認可画面および認可管理用Web UIは実装しない�
 DBパスワードを保持・取得しない。
 
 Aurora管理者資格情報だけをSecrets Managerで管理し、
-DBユーザー作成およびスキーマ適用を行うMigration Lambdaからのみ利用する。
+Issue #11ではスキーマ適用を行うMigration Lambdaからのみ利用する。
+Application DBユーザーの作成は後続Issueで扱う。
 Migration LambdaはVPC外からRDS Data APIを呼び出すため、
 Secrets Manager Interface VPC Endpointは作成しない。
 詳細は10.2節および10.3節に定義する。
@@ -1346,6 +1544,8 @@ CloudWatch Logs
 
 ### Stream Metadata Lambda
 
+以下は後続のStream Metadata Lambda実装Issueで設定する。
+
 ```text
 rds-db:connect
 Resource: arn:aws:rds-db:<region>:<account-id>:dbuser:<cluster-resource-id>/stream_metadata_user
@@ -1353,6 +1553,8 @@ CloudWatch Logs
 ```
 
 ### Analyzer Lambda
+
+以下は後続のAnalyzer Lambda実装Issueで設定する。
 
 ```text
 SQS ReceiveMessage
@@ -1365,6 +1567,8 @@ CloudWatch Logs
 
 ### Analysis Finalizer Lambda
 
+以下は後続のAnalysis Finalizer Lambda実装Issueで設定する。
+
 ```text
 rds-db:connect
 Resource: arn:aws:rds-db:<region>:<account-id>:dbuser:<cluster-resource-id>/analysis_finalizer_user
@@ -1372,6 +1576,8 @@ CloudWatch Logs
 ```
 
 ### API Lambda
+
+以下は後続のAPI Lambda実装Issueで設定する。
 
 ```text
 rds-db:connect
@@ -1384,15 +1590,15 @@ CloudWatch Logs
 ```text
 rds-data:BeginTransaction
 rds-data:ExecuteStatement
-rds-data:BatchExecuteStatement
 rds-data:CommitTransaction
 rds-data:RollbackTransaction
 Resource: <Aurora cluster ARN>
 secretsmanager:GetSecretValue
 Resource: <stream-insight/dev/aurora/admin Secret ARN>
-KMS Decrypt（カスタマー管理KMS Keyを使用する場合のみ）
 CloudWatch Logs
 ```
+
+現状はCustomer Managed KMS Keyを使用しないため、Migration用途の追加`kms:Decrypt`は付与しない。
 
 `rds-db:connect`のResourceはLambdaごとのDBユーザーへ限定する。
 Migration Lambda以外のアプリケーションLambdaには、
@@ -1632,7 +1838,7 @@ PoCでは以下のStack構成を基本とする。
 - Step Functions Log Group
 - Parameter Store
 - YouTube OAuth用Secrets Manager Secret
-- Lambda実行RoleおよびDBユーザー単位の`rds-db:connect` Policy
+- Lambda実行RoleおよびDBユーザー単位の`rds-db:connect` Policy（後続のApplication Lambda実装Issueで追加）
 - CloudWatch Alarm
 - AWS Budget
 
