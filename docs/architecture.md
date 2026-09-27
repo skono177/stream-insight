@@ -554,16 +554,29 @@ Input：
 1つのトランザクションで対象Collection Jobを行ロックし、IDとExecution ARNの対応を確認する。
 収集中のJobは拒否する。`analysis_status`がPENDINGまたはFINALIZINGならFAILEDへ更新し、
 機密情報を含まない`error_code`を保存する。既にFAILEDなら再実行を成功とし、最初のエラー種別を保持する。
-既にCOMPLETEDならFAILEDへ戻さず、現在のCOMPLETED状態を返す。
+既にCOMPLETEDならDBを更新せず、`analysis_status`をFAILEDへ戻さず、`error_code`も上書きしない。
+この場合は現在のCOMPLETED状態を返す。
 `analysis_finalized_at`はAnalysis Finalizerによる正常確定時刻であるため、このOperationでは設定しない。
 
-Output：
+Outputの`analysisStatus`は`"FAILED"`または`"COMPLETED"`とし、処理後の実際の保存状態を返す。
+
+PENDING、FINALIZINGまたはFAILEDの場合：
 
 ```json
 {
   "streamId": "1",
   "collectionJobId": "1",
   "analysisStatus": "FAILED"
+}
+```
+
+COMPLETEDの場合：
+
+```json
+{
+  "streamId": "1",
+  "collectionJobId": "1",
+  "analysisStatus": "COMPLETED"
 }
 ```
 

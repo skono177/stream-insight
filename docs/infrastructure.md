@@ -1028,13 +1028,20 @@ Rollback失敗時は元のエラー分類を保持してRollback失敗を安全�
 | --- | --- | --- |
 | `VALIDATION` | Retryしない | 必須項目不足、形式不正、未知の項目 |
 | `STATE_CONFLICT` | Retryしない | ID対応不一致、許可されない状態遷移、Batch内容不一致 |
-| `DB_AUTHENTICATION` | Retryしない | IAM token、`rds_iam`、DB user設定不備 |
-| `DB_AUTHORIZATION` | Retryしない | `rds-db:connect`またはDB Object権限不足 |
+| `DB_AUTHENTICATION` | Retryしない | PostgreSQL接続時に認証失敗として観測したSQLSTATE `28P01`、`28000` |
+| `DB_AUTHORIZATION` | Retryしない | DB接続成功後、SQL実行時の権限不足として観測したSQLSTATE `42501` |
 | `DB_CONSTRAINT` | Retryしない | CHECK / FK等の入力・状態起因違反 |
 | `DB_CONNECTION_TRANSIENT` | Retry可能 | Aurora復帰中、一時的な接続切断 |
 | `DB_TRANSACTION_TRANSIENT` | Retry可能 | deadlock、serialization failure |
 | `COMMIT_OUTCOME_UNKNOWN` | 同じ入力でRetry | Commit応答を確認できない |
 | `TIME_BUDGET` | 呼び出し元でRetry可能 | 安全に処理・Rollbackできる残り時間不足 |
+
+エラー分類はApplicationから観測できたSQLSTATEと、接続フェーズまたはSQL実行フェーズに基づいて行う。
+IAM DB Authenticationの接続拒否では、`rds-db:connect`不足、IAM token不正、`rds_iam`不足、
+DB user設定不正等の根本原因をSQLSTATEだけから常に区別できるとは限らない。
+接続フェーズで`28P01`または`28000`を観測した場合は根本原因を推測せず`DB_AUTHENTICATION`、
+接続成功後のSQL実行フェーズで`42501`を観測した場合は`DB_AUTHORIZATION`へ分類する。
+ログでも観測できないAWS側の根本原因を断定しない。
 
 #### 10.2.2. Stream Metadata LambdaのDB User / 権限
 
