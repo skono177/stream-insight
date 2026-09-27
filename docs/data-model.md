@@ -87,9 +87,9 @@ PoCではJSON Lines（JSONL）形式を基本とする。
 例：
 
 ```json
-{"commentId":"001","streamId":"stream-001","text":"こんにちは","publishedAt":"2026-08-23T15:00:00Z"}
-{"commentId":"002","streamId":"stream-001","text":"今日も楽しみ","publishedAt":"2026-08-23T15:00:05Z"}
-{"commentId":"003","streamId":"stream-001","text":"きた！","publishedAt":"2026-08-23T15:00:08Z"}
+{"commentId":"001","streamId":"1","text":"こんにちは","publishedAt":"2026-08-23T15:00:00Z"}
+{"commentId":"002","streamId":"1","text":"今日も楽しみ","publishedAt":"2026-08-23T15:00:05Z"}
+{"commentId":"003","streamId":"1","text":"きた！","publishedAt":"2026-08-23T15:00:08Z"}
 ```
 
 将来的に大量データの分析効率を高める必要が生じた場合は、Parquet等の列指向フォーマットへの変更を検討する。
@@ -174,6 +174,17 @@ YouTube Liveの配信を表す。
 配信中または実終了日時が未取得の場合はNULLとし、収集停止時刻・現在時刻・予定終了時刻で補完しない。
 終了時にData Collectorが再取得し、Stream Metadata Lambdaが更新する。
 取得できなかった項目で既存値をNULLへ上書きせず、開始処理の再実行でも確定済み終了日時を保持する。
+
+`channels.url`と`streams.url`は入力Contractへ重複して持たせず、Stream Metadata Lambdaが
+YouTube Channel IDとVideo IDからそれぞれ次の形式で決定的に生成する。
+
+```text
+https://www.youtube.com/channel/<youtubeChannelId>
+https://www.youtube.com/watch?v=<youtubeVideoId>
+```
+
+`streams.youtubeLiveChatId`はPoCのコメント分析開始に必須とする。
+Live Chat IDを取得できない配信は分析開始対象外とし、NULL許容へのSchema変更は行わない。
 
 ---
 
@@ -613,10 +624,10 @@ Payload SHA-256はこのバイト列から算出し、`collection_job_batches`�
 ```json
 {
   "batchId": "batch-v1-4e6b8ac84f87fe828dfc6fa7c2bd2cbc4efd017322d650913bcae10bec864ad6",
-  "streamId": "stream-001",
-  "collectionJobId": "collection-job-001",
+  "streamId": "1",
+  "collectionJobId": "1",
   "analysisStartAt": "2026-08-23T15:00:20Z",
-  "videoId": "youtube-video-id",
+  "youtubeVideoId": "youtube-video-id",
   "comments": [
     {
       "commentId": "comment-001",
@@ -663,7 +674,7 @@ Data Collectorは以下の手順で各送信バッチを生成する。
 4. 各分割バッチについて、以下の固定順序の配列をJSON化し、そのUTF-8バイト列のSHA-256を算出する
 
 ```text
-["batch-v1", streamId, videoId,
+["batch-v1", streamId, youtubeVideoId,
   [[commentId, text, publishedAt], ...]]
 ```
 
@@ -802,6 +813,23 @@ StatusにはDEFAULTを設定せず、処理開始側が明示的に値を指定�
 | --- | --- |
 | `collection_status` | `RUNNING` / `COMPLETED` / `FAILED` |
 | `analysis_status` | `PENDING` / `FINALIZING` / `COMPLETED` / `FAILED` |
+
+#### 8.1.7. BIGINTのJSON表現
+
+PostgreSQL `BIGINT`で保持する内部ID、およびStream Metadata Lambdaが入出力する
+`collectedCommentCount`は、Node.jsの`Number.MAX_SAFE_INTEGER`を超える場合も精度を失わないよう、
+Lambda Input / OutputおよびStep Functions stateでは10進JSON stringとして扱う。
+DB ClientでもこれらをJavaScript `number`へ変換しない。
+
+対象には少なくとも以下を含む。
+
+- `channelId`
+- `streamId`
+- `collectionJobId`
+- `collectedCommentCount`
+
+内部IDは正の10進整数文字列、0を許容する件数は非負の10進整数文字列として検証し、
+指数表記、符号、空文字および不要な先頭ゼロを許可しない。APIレスポンスでも内部IDはJSON stringとする。
 
 ### 8.2. Application / Analysis Data物理定義
 
@@ -1163,7 +1191,48 @@ Raw Dataから再分析する場合も`(streamId, commentId)`で重複を除く�
 コメント集合の部分的な重複、同一バッチ・重複コメントの並行処理、
 Aurora Commit前後の失敗で集計値が二重加算されないことを検証する。
 
-#### 9.5.1. 分析完了判定と確定処理
+#### 9.5.1. Stream Metadata Lambda
+
+Stream Metadata Lambdaの4 Operationは、それぞれ1 Transactionで処理する。
+
+| Operation | 主な冪等性Key | 同一入力の再実行 |
+| --- | --- | --- |
+| `START_COLLECTION` | `channels.youtube_channel_id`、`streams.youtube_video_id`、`collection_jobs.execution_arn`、`collection_jobs.stream_id` | 同じStream、Execution ARN、開始時刻の既存行を返す |
+| `REGISTER_BATCHES` | `collection_job_batches(collection_job_id, batch_id)` | Object keyとSHA-256が一致する既存Batchを成功扱いする |
+| `STOP_COLLECTION` | `collection_jobs.id`と終端状態 | 同じ終端情報を成功扱いし、終端状態を変更しない |
+| `MARK_ANALYSIS_FAILED` | `collection_jobs.id`と`analysis_status` | FAILEDを維持し、COMPLETEDをFAILEDへ戻さない |
+
+`START_COLLECTION`ではChannel、StreamおよびCollection Jobを同じTransactionで登録する。
+同じYouTube Video IDの既存Streamについて、ChannelまたはLive Chat IDが入力と異なる場合は
+既存関係を更新せず不整合として失敗させる。Channel名、配信タイトル、配信開始日時および
+決定的に生成したURLは最新の開始入力で更新する。開始処理は既存`ended_at`を変更しない。
+既存Channel / Streamの業務項目と入力から導出した業務項目が完全一致する再実行では、
+ChannelおよびStreamに対するUPDATE SQL自体を実行せず、`updated_at`も変更しない。
+既存行をそのまま使用して後続処理へ進む。許可された業務項目に実際の差分がある場合だけ、
+その業務項目をUPDATEし、同じUPDATEで`updated_at`を更新する。
+
+`REGISTER_BATCHES`ではCollection Jobを行ロックし、初回の`observation_started_at`保存、
+`stream_metrics`初期化および全Batch登録を同じTransactionで行う。
+`analysis_start_at`は`streams.started_at`と`observation_started_at`の遅い方とし、
+一度保存した値を変更しない。同じBatch IDの既存行と`outbox_object_key`または
+`payload_sha256`が異なる場合は、既存行を上書きせずTransaction全体を失敗させる。
+
+`STOP_COLLECTION`では最終StreamメタデータとCollection Job終端状態を同じTransactionで更新する。
+`RUNNING`から`COMPLETED`または`FAILED`への遷移だけを許可し、終端状態間の変更は許可しない。
+`COMPLETED`では`analysis_status=FINALIZING`、`FAILED`では`analysis_status=FAILED`とする。
+終端状態への再実行では、入力`youtubeVideoId`と保存済み`streams.youtube_video_id`、
+`title`、`started_at`、`ended_at`、`collection_stopped_at`、`collection_status`、`last_page_token`、
+`collected_comment_count`、`stop_reason`および`error_code`の一致を確認し、
+いずれかが相違する場合は`STATE_CONFLICT`として拒否する。
+NULLの終了日時で既存値を消さず、既存の非NULL終了日時と異なる値も受け入れない。
+FAILED Jobの復旧時に限り、他の終端情報を保持して終了日時をNULLから実値へ補完でき、
+これを終端状態への再実行における唯一の例外とする。
+
+`MARK_ANALYSIS_FAILED`はFinalizerの再試行上限到達等を記録する。
+PENDINGまたはFINALIZINGをFAILEDへ変更できるが、COMPLETEDは変更しない。
+`analysis_finalized_at`の設定と`analysis_status=COMPLETED`への更新はAnalysis Finalizerの責務とする。
+
+#### 9.5.2. 分析完了判定と確定処理
 
 終了メタデータ保存後、Analysis Finalizerは対象収集ジョブについて、
 `collection_job_batches`に存在し、`processed_comment_batches`に存在しない`batchId`の件数を確認する。

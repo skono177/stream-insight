@@ -134,7 +134,7 @@ Stage名はOrigin Pathで付与し、CloudFront Functionでは付与しない。
 | ブラウザのリクエスト              | Functionによる変換後          | API Gatewayへの転送パス（Origin Pathを含む） |
 | --------------------------------- | ----------------------------- | -------------------------------------------- |
 | `/api/streams`                    | `/streams`                    | `/dev/streams`                               |
-| `/api/streams/stream-001/metrics` | `/streams/stream-001/metrics` | `/dev/streams/stream-001/metrics`            |
+| `/api/streams/1/metrics`          | `/streams/1/metrics`          | `/dev/streams/1/metrics`                     |
 | `/api/streams?limit=20&offset=0`  | `/streams?limit=20&offset=0`  | `/dev/streams?limit=20&offset=0`             |
 
 クエリ文字列はOrigin Request Policyでも転送を許可する。
@@ -224,9 +224,9 @@ PoCではページングの詳細仕様は実装時に決定する。
 {
   "items": [
     {
-      "streamId": "stream-001",
+      "streamId": "1",
       "videoId": "youtube-video-id",
-      "channelId": "channel-001",
+      "channelId": "1",
       "title": "配信タイトル",
       "startedAt": "2026-08-23T15:00:00Z",
       "endedAt": "2026-08-23T17:00:00Z",
@@ -266,9 +266,9 @@ GET /api/streams/{streamId}
 
 ```json
 {
-  "streamId": "stream-001",
+  "streamId": "1",
   "videoId": "youtube-video-id",
-  "channelId": "channel-001",
+  "channelId": "1",
   "title": "配信タイトル",
   "startedAt": "2026-08-23T15:00:00Z",
   "endedAt": "2026-08-23T17:00:00Z",
@@ -300,7 +300,7 @@ GET /api/streams/{streamId}/metrics
 
 ```json
 {
-  "streamId": "stream-001",
+  "streamId": "1",
   "totalComments": 12500,
   "averageCommentLength": 12.8,
   "averageCommentsPerMinute": 104.2,
@@ -364,7 +364,7 @@ GET /api/streams/{streamId}/timeline
 
 ```json
 {
-  "streamId": "stream-001",
+  "streamId": "1",
   "unit": "minute",
   "analysisStartAt": "2026-08-23T15:00:20Z",
   "analysisEndAt": "2026-08-23T15:02:00Z",
@@ -428,7 +428,7 @@ GET /api/streams/{streamId}/length-distribution
 
 ```json
 {
-  "streamId": "stream-001",
+  "streamId": "1",
   "analysisStartAt": "2026-08-23T15:00:20Z",
   "analysisEndAt": "2026-08-23T17:00:00Z",
   "analysisStatus": "COMPLETED",
@@ -503,7 +503,7 @@ GET /api/streams/{streamId}/frequent-words
 
 ```json
 {
-  "streamId": "stream-001",
+  "streamId": "1",
   "analysisStartAt": "2026-08-23T15:00:20Z",
   "analysisEndAt": "2026-08-23T17:00:00Z",
   "analysisStatus": "COMPLETED",
@@ -586,6 +586,10 @@ channelId
 
 YouTube API上のIDとは分離して管理する。
 
+内部IDの物理型はPostgreSQL `BIGINT`であるため、JavaScriptでの精度損失を避ける目的で
+APIのPath ParameterおよびJSON Responseでは正の10進文字列として表現する。
+Node.jsで`number`へ変換せず、DB Clientから取得した文字列表現を検証して使用する。
+
 ---
 
 ## 8.2. YouTube固有情報
@@ -596,6 +600,11 @@ YouTube API上のIDとは分離して管理する。
 - YouTube Channel ID
 - YouTube URL
 - 配信タイトル
+
+内部ワークフローとStream Metadata LambdaのContractでは外部IDを`youtubeVideoId`、
+`youtubeChannelId`、`youtubeLiveChatId`と明示する。公開REST APIでは既存Contractを維持し、
+YouTube Video IDを`videoId`として返す。APIの`channelId`はStream Insight内部IDであり、
+YouTube Channel IDではない。
 
 ---
 

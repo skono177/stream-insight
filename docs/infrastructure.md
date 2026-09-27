@@ -367,32 +367,47 @@ Data Collectorを送信モードで呼び出す。
 
 役割：
 
-- 配信メタデータの受信
-- `channels`の作成・更新
-- `streams`の作成・更新
-- 終了時の最終メタデータ（`endedAt`を含む）更新
-- Execution ARNを一意キーとする`collection_jobs`の開始登録・終了状態更新
-- `collection_jobs.streamId`の一意制約による別Executionの重複開始拒否
-- Finalizer失敗時の`analysisStatus=FAILED`を記録する失敗状態更新モード
-- 収集成功時の`analysisStatus=FINALIZING`、収集失敗時の`analysisStatus=FAILED`への更新
-- `collection_jobs.observationStartedAt`および`stream_metrics.analysisStartAt`の初回保存
-- SQS送信前の`batchId`、Outboxオブジェクトキー、Payload SHA-256の`collection_job_batches`への冪等登録
-- 内部`channelId`の採番・取得
-- 内部`streamId`の採番・取得
+- `START_COLLECTION`による`channels`、`streams`および`collection_jobs`の開始登録
+- `REGISTER_BATCHES`による観測開始時刻、`stream_metrics`および送信前Batchの冪等登録
+- `STOP_COLLECTION`による最終配信メタデータとCollection Job終端状態の同時更新
+- `MARK_ANALYSIS_FAILED`によるFinalizer失敗状態の記録
 - Step Functionsへの内部`streamId`および`collectionJobId`返却
 
 想定Function名：
 
 ```text
-stream-insight-stream-metadata
+stream-insight-dev-stream-metadata
 ```
 
+実装・実行設定：
+
+| 項目 | 方針 |
+| --- | --- |
+| Language | TypeScript |
+| Runtime | Node.js 24.x |
+| CDK Construct | `NodejsFunction` |
+| Bundler | esbuild |
+| Memory | 256 MB |
+| Timeout | 60秒 |
+| Reserved Concurrency | 1 |
+| Log retention | 7日 |
+| Log removal policy | DESTROY |
+
+Reserved ConcurrencyはPoCで同時DB接続数を1本に抑えるため1とする。
+複数配信の同時収集を対象にする段階で、Aurora接続数と合わせて再評価する。
+
 YouTube Channel IDおよびVideo IDは外部IDとして扱う。
+入力名は`youtubeChannelId`、`youtubeVideoId`、`youtubeLiveChatId`、
+内部ID名は`channelId`、`streamId`、`collectionJobId`とする。
+内部`BIGINT`はLambdaおよびStep FunctionsのJSONでは10進stringとして扱う。
 
 同一外部IDが既に登録されている場合は既存レコードを利用し、
 重複レコードを作成しない。
 
 Stream Metadata LambdaはAuroraへの接続が必要となるためVPC内へ配置する。
+YouTube API、S3およびSQSへは直接アクセスしない。
+OperationごとのInput / Output、Transaction、状態遷移および更新規則は
+`architecture.md`の4.4節を正とする。
 
 ---
 
@@ -486,7 +501,7 @@ Step Functionsから配信終了後に呼び出す。
 収集失敗時はStream Metadata Lambdaが`analysisStatus=FAILED`を保存し、
 Step FunctionsはAnalysis Finalizerを呼び出さずExecutionを失敗させる。
 Finalizer自身のRetry上限到達時も、Step FunctionsのCatchから
-Stream Metadata Lambdaの失敗状態更新モードを別Taskとして再試行する。
+Stream Metadata Lambdaの`MARK_ANALYSIS_FAILED`を別Taskとして再試行する。
 
 Auroraへ接続するためVPC内へ配置し、Reserved Concurrencyは1とする。
 1実行につき物理接続を最大1本とし、実行終了前に閉じる。
@@ -563,7 +578,7 @@ Start
 Get Stream Metadata
 (Data Collector Lambda)
   ↓
-Persist Stream Metadata
+START_COLLECTION
 (Stream Metadata Lambda)
   ↓
 internal streamId
@@ -574,7 +589,7 @@ Collect Comments
 Save Outbox Payload
 (S3)
   ↓
-Register Outbox Batch
+REGISTER_BATCHES
 (Stream Metadata Lambda)
   ↓
 Send Registered Payload
@@ -585,7 +600,7 @@ Live Chat終了？
   │     ↓
   │    Get Final Stream Metadata (Data Collector Lambda)
   │     ↓
-  │    Persist Final Metadata / Collection Status (Stream Metadata Lambda)
+  │    STOP_COLLECTION (Stream Metadata Lambda)
   │     ↓
   │    collectionStatus?
   │      ├── FAILED → analysisStatus=FAILED → Fail
@@ -612,8 +627,8 @@ Data Collector LambdaおよびStream Metadata Lambdaから返却された
 ```text
 streamId
 collectionJobId
-videoId
-liveChatId
+youtubeVideoId
+youtubeLiveChatId
 nextPageToken
 pollingInterval
 observationStartedAt
@@ -888,6 +903,15 @@ Public Access: Disabled
 Security Groupによって、
 Stream Metadata Lambda、Analyzer Lambda、Analysis Finalizer LambdaおよびAPI Lambdaからのアクセスのみ許可する。
 
+Stream Metadata Lambdaは既存VPCのPrivate Isolated Subnetへ配置し、
+NetworkStackの既存Application Security Groupを使用する。Aurora Security Groupには
+CIDRではなくApplication Security GroupをsourceとするTCP 5432のIngressだけを追加する。
+新しいApplication Security Group、NAT Gateway、Interface VPC EndpointおよびRDS Proxyは追加しない。
+
+Aurora Security Group自体をStack間公開する必要はなく、公開済み`DatabaseCluster`の
+`connections`から許可を設定する。共有Application Security Groupの既存Outbound既定値は
+本Issueで変更せず、他Application Lambdaの将来通信へ影響する作り直しを行わない。
+
 ---
 
 ### 10.2. 認証・接続
@@ -901,7 +925,7 @@ Aurora PostgreSQLではIAM DB認証を有効化する。
 
 | Lambda                    | DBユーザー               | DB権限                                                                                                                        |
 | ------------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
-| Stream Metadata Lambda    | `stream_metadata_user`   | `channels`、`streams`、`stream_metrics`、`collection_jobs`、`collection_job_batches`への必要なSELECT / INSERT / UPDATE、およびSequenceのUSAGE |
+| Stream Metadata Lambda    | `stream_metadata_user`   | 4 Operationに必要な対象TableのSELECT / INSERT / UPDATE、およびIdentity SequenceのUSAGE |
 | Analyzer Lambda           | `analyzer_user`          | 分析結果・処理済み管理テーブルへの必要なSELECT / INSERT / UPDATE、およびSequenceのUSAGE                                    |
 | Analysis Finalizer Lambda | `analysis_finalizer_user` | 送信・処理済みバッチのSELECT、分析結果・`collection_jobs`への必要なSELECT / INSERT / UPDATE                               |
 | API Lambda                | `api_readonly_user`      | APIが参照するテーブルへのSELECTのみ                                                                                           |
@@ -927,7 +951,9 @@ Lambdaは接続を新規作成する直前にAWS SDKでIAM認証トークンを�
 
 IAM認証トークンの生成は署名処理であり、RDS APIへの通信を必要としない。
 Lambda実行環境に提供される実行Roleの一時認証情報を使用するため、
-アプリケーションLambda用のSecrets Manager VPC EndpointおよびNAT Gatewayは不要とする。
+現在の構成ではSecrets Manager、RDS APIおよびSTSへの実行時通信を行わない。
+アプリケーションLambda用のNAT GatewayおよびInterface VPC Endpointは不要とする。
+将来、別RoleのAssumeRoleや外部Credential Providerを採用する場合は、STS等への通信経路を再評価する。
 
 DB接続ではTLSを必須とし、AWSが提供するRDS CA bundleで証明書とホスト名を検証する。
 証明書検証を無効化しない。
@@ -938,20 +964,108 @@ DB_HOST=<Aurora cluster endpoint>
 DB_PORT=5432
 DB_NAME=stream_insight
 DB_USER=<LambdaごとのDBユーザー>
-AWS_REGION=<deployment region>
 ```
+
+RegionにはLambdaが予約環境変数として提供する`AWS_REGION`を使用する。
+CDKから`AWS_REGION`を独自設定しない。
 
 認証トークンはDBホスト名・ポート・ユーザー名・Regionに対して生成し、
 接続設定と同じ値を使用する。
 新しい物理接続ごとに新しいトークンを生成する。
 既存接続の再利用は可能だが、期限切れトークンを新規接続へ再利用しない。
 接続プールには上限を設定し、Lambdaの同時実行数と合わせてAuroraの最大接続数を超えないようにする。
+Stream Metadata LambdaではPoC中の接続管理を単純化するため、接続プールを使用せず、
+1 invocationにつき1本の物理接続を作成して処理終了前に閉じる。
 Analyzer Lambdaでは接続プールを使用せず、1実行あたりの物理接続を1本に限定して実行終了前に閉じる。
 Analysis Finalizer Lambdaも1実行あたりの物理接続を1本に限定して実行終了前に閉じる。
 
 Security Groupは、Stream Metadata Lambda、Analyzer Lambda、Analysis Finalizer LambdaおよびAPI Lambdaから
 AuroraのTCP 5432への通信だけを許可する。
 AuroraはPublic Accessを無効化し、インターネットからの接続を許可しない。
+
+#### 10.2.1. Stream Metadata LambdaのDB Client / TLS
+
+Stream Metadata LambdaはNode.jsの`pg`と`@aws-sdk/rds-signer`を使用する。
+接続を新規作成する直前にSignerでIAM認証トークンを生成し、`pg`のpasswordとして渡す。
+RDS CA bundleをLambda assetへ同梱し、TLS設定は`rejectUnauthorized: true`として
+CAおよびAurora cluster endpointのホスト名を検証する。証明書検証を無効化しない。
+
+1 invocationの接続処理は次の順序とする。
+
+```text
+IAM認証トークン生成
+  ↓
+Aurora Writerへ接続
+  ↓
+BEGIN
+  ↓
+OperationのDB処理
+  ↓
+COMMIT または ROLLBACK
+  ↓
+接続をclose
+```
+
+Lambda timeoutは60秒、`connectionTimeoutMillis`は10秒、`query_timeout`および
+PostgreSQL `statement_timeout`は10秒を初期値とする。無制限待機は許可しない。
+各DB処理前にLambda残り時間を確認し、query timeoutに加えてRollbackとclose用の5秒を
+確保できない場合は新しい処理を開始しない。
+
+Aurora Auto-pauseからの復帰等、Transaction開始前の一時的な接続失敗だけを、初回を含む最大3回の接続試行で扱う。
+再試行間隔は上限1秒、2秒のfull jitterとし、各接続試行で新しいIAM認証トークンを生成する。
+残り時間を確保できない場合は上限前でも再試行しない。認証拒否、入力不正、権限不足、
+SQL構文エラーおよびConstraint違反は接続再試行の対象としない。
+
+Transaction開始後の失敗ではRollbackし、Operation全体を失敗させる。
+Commit要求後に応答を確認できない場合は結果不明としてRollbackせず接続を破棄し、
+再試行可能な分類でエラーを返す。同じ入力の再実行はOperationごとの一意制約と状態遷移条件で収束させる。
+Rollback失敗時は元のエラー分類を保持してRollback失敗を安全な付加情報として記録し、接続を再利用しない。
+
+エラーは少なくとも次の分類を持つ。Lambdaは失敗時にplain JSONの成功値を返さず例外とし、
+将来のStep FunctionsがRetry / Catchを設定できる安定した分類名を使用する。
+
+| 分類 | Retry方針 | 例 |
+| --- | --- | --- |
+| `VALIDATION` | Retryしない | 必須項目不足、形式不正、未知の項目 |
+| `STATE_CONFLICT` | Retryしない | ID対応不一致、許可されない状態遷移、Batch内容不一致 |
+| `DB_AUTHENTICATION` | Retryしない | IAM token、`rds_iam`、DB user設定不備 |
+| `DB_AUTHORIZATION` | Retryしない | `rds-db:connect`またはDB Object権限不足 |
+| `DB_CONSTRAINT` | Retryしない | CHECK / FK等の入力・状態起因違反 |
+| `DB_CONNECTION_TRANSIENT` | Retry可能 | Aurora復帰中、一時的な接続切断 |
+| `DB_TRANSACTION_TRANSIENT` | Retry可能 | deadlock、serialization failure |
+| `COMMIT_OUTCOME_UNKNOWN` | 同じ入力でRetry | Commit応答を確認できない |
+| `TIME_BUDGET` | 呼び出し元でRetry可能 | 安全に処理・Rollbackできる残り時間不足 |
+
+#### 10.2.2. Stream Metadata LambdaのDB User / 権限
+
+専用login roleとして`stream_metadata_user`を使用し、PostgreSQLの`rds_iam`を付与する。
+Application runtimeは管理者Secretを取得せず、DB userも作成しない。
+
+`stream_metadata_user`は既存Migration基盤の新しいVersion
+`002_stream_metadata_user`で作成し、既存`001_initial_schema`は変更しない。
+同じVersionで以下の最小権限を付与する。
+
+| Object | 権限 |
+| --- | --- |
+| Database `stream_insight` | `CONNECT` |
+| Schema `public` | `USAGE` |
+| `channels` | `SELECT`, `INSERT`, `UPDATE` |
+| `streams` | `SELECT`, `INSERT`, `UPDATE` |
+| `stream_metrics` | `SELECT`, `INSERT` |
+| `collection_jobs` | `SELECT`, `INSERT`, `UPDATE` |
+| `collection_job_batches` | `SELECT`, `INSERT` |
+| `channels_id_seq` | `USAGE` |
+| `streams_id_seq` | `USAGE` |
+| `collection_jobs_id_seq` | `USAGE` |
+
+`DELETE`、`TRUNCATE`、schema `CREATE`、DDL、Table / Sequence所有権、他Tableの権限および
+grant optionは付与しない。`stream_metrics`と`collection_job_batches`は既存行を上書きせず、
+一致確認だけを行うためUPDATEを付与しない。
+
+現行MigrationはTable / SequenceをPUBLICへGRANTしておらず、PostgreSQL既定でもこれらへの
+PUBLIC権限はない。Issue #13では対象Table / Sequenceへの不要なPUBLIC GRANTを追加せず、
+DatabaseやSchema全体への広範なREVOKE、`ALTER DEFAULT PRIVILEGES`も行わない。
+他Application LambdaやMigrationへの副作用を避け、必要な権限を専用userへ直接GRANTする。
 
 ### 10.3. DBスキーマ適用・DBユーザー責務
 
@@ -1002,6 +1116,13 @@ Migration LambdaをService TokenとするLambda-backed CDK Custom Resourceを使
 - `cdk synth`ではMigrationを実行しない
 
 Migration成功後にアプリケーションLambdaを利用可能とする依存関係をCDKで設定する。
+Stream Metadata Lambdaは`DatabaseMigration` Custom Resourceへ明示的なCloudFormation dependencyを持たせ、
+新しい`002_stream_metadata_user`を含むMigration成功後にLambda resourceを作成・更新する。
+
+Lambda resourceの作成はDB接続を発生させず、Lambda invokeとは別である。
+Issue #13ではStep Functionsを作成しないため、実際のinvoke順序は将来のState Machineで
+`START_COLLECTION`等のTask順として定義する。Stackのdeploy中に既存Aliasや別の呼び出し元から
+invokeする運用を追加する場合は、Migration完了後の切替手順を別途設計する。
 
 #### 10.3.3. Version SQL
 
@@ -1183,6 +1304,11 @@ Issue #11の初期MigrationではApplication DBユーザーを作成しない。
 
 これらは後続の各Application Lambda実装Issueで、必要な権限および接続方式と合わせて設計・実装する。
 将来、DBユーザー作成をVersion Migrationで管理することは妨げないが、Issue #11のスコープ外とする。
+
+Issue #13では`stream_metadata_user`を新しいVersion `002_stream_metadata_user`で管理する。
+ユーザー作成、`rds_iam`および対象Objectへの最小権限を同じVersionで適用し、
+適用済みの`001_initial_schema`は変更しない。Analyzer、Analysis FinalizerおよびAPI用userは
+引き続き各Application Lambda実装Issueの対象とする。
 
 Data APIを利用できるAurora PostgreSQLのEngine VersionをCDKで明示し、
 デプロイ対象Regionで利用可能であることを事前に確認する。
@@ -1544,13 +1670,24 @@ CloudWatch Logs
 
 ### Stream Metadata Lambda
 
-以下は後続のStream Metadata Lambda実装Issueで設定する。
+Issue #13で以下を設定する。
 
 ```text
 rds-db:connect
 Resource: arn:aws:rds-db:<region>:<account-id>:dbuser:<cluster-resource-id>/stream_metadata_user
-CloudWatch Logs
+CloudWatch Logs: 明示作成したStream Metadata Lambda Log Groupのみ
+VPC ENI管理: LambdaのVPC配置に必要なEC2操作
 ```
+
+`rds-db:connect`はRDS Cluster ARNではなく、Aurora DB Cluster Resource IDと
+`stream_metadata_user`を組み合わせたARNへ限定する。CDKでは公開済み`DatabaseCluster`の
+`grantConnect()`を利用でき、StorageStackからResource IDやAurora Security Groupを
+追加公開する必要はない。
+
+VPC Lambdaに必要な`ec2:CreateNetworkInterface`、`ec2:DescribeNetworkInterfaces`、
+`ec2:DescribeSubnets`、`ec2:DeleteNetworkInterface`、`ec2:AssignPrivateIpAddresses`および
+`ec2:UnassignPrivateIpAddresses`は、これらのActionが要求する範囲でResource `*`を許可する。
+これはDB接続対象のwildcard化を意味せず、`rds-db:connect`は上記の専用DB userへ限定する。
 
 ### Analyzer Lambda
 
@@ -1681,6 +1818,12 @@ CloudFormation Stack削除時に対象Log Groupも削除する。
 - Refresh Token
 - Access Token
 - YouTube Data API Key
+- IAM DB認証トークン
+- DB PasswordおよびSecret値
+- 完全なDB接続文字列
+- `pg` Client設定全体
+- Lambda event全体
+- 不要なSQL全文およびSQL parameter値
 - その他の認証情報
 
 コメント処理の追跡が必要な場合は、
@@ -1694,6 +1837,10 @@ batchId
 処理結果
 エラー種別
 ```
+
+Stream Metadata Lambdaは、必要な場合に限りAWS Request ID、Operation、内部ID、
+機密情報を含まないerror classification、PostgreSQL error code、retry回数およびelapsed timeを
+構造化ログとして記録する。入力値やDB Client error objectをそのままシリアライズしない。
 
 エラー発生時も、
 外部APIレスポンスやSQSメッセージをそのままログへ出力しない。
@@ -1841,6 +1988,21 @@ PoCでは以下のStack構成を基本とする。
 - Lambda実行RoleおよびDBユーザー単位の`rds-db:connect` Policy（後続のApplication Lambda実装Issueで追加）
 - CloudWatch Alarm
 - AWS Budget
+
+`stream-insight.ts`からBackendStackへ渡すStream Metadata Lambda用Resourceは次に限定する。
+
+- NetworkStackのVPC
+- NetworkStackのApplication Security Group
+- StorageStackのDatabaseCluster
+
+Stream Metadata Lambdaが直接利用しないRaw Data BucketおよびS3 Gateway VPC Endpointは渡さない。
+Database endpoint、port、DB Cluster Resource ID、IAM connect grantおよびSecurity Group接続設定は
+公開済みDatabaseClusterから取得する。Aurora Security GroupやResource IDを新たな
+`public readonly` propertyとして公開しない。
+
+BackendStack内では`DatabaseMigration` Custom Resourceを参照可能なconstructとして保持し、
+Stream Metadata Lambdaから明示依存を設定する。Stack間依存はVPCとApplication Security Groupの参照による
+BackendStack → NetworkStack、およびDatabaseCluster参照によるBackendStack → StorageStackとする。
 
 CloudWatch Log Groupsには以下を設定する。
 
