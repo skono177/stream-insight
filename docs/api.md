@@ -332,7 +332,8 @@ GET /api/streams/{streamId}/metrics
 Unicode 15.1.0のUnicode Standard Annex #29で定義される
 拡張書記素クラスタ単位で数えた文字数の合計を、`totalComments`で除して算出する。
 空文字は文字数`0`として分母に含め、`totalComments`が`0`の場合は`0`を返す。
-計算途中では丸めず、小数第1位へ四捨五入して返す。
+`averageCommentLength`および`averageCommentsPerMinute`は計算途中では丸めず、
+APIレスポンス生成時に小数第1位へ四捨五入して返す。
 
 `analysisStatus`はPENDING / FINALIZING / COMPLETED / FAILEDのいずれかを返す。
 終了後の確定値として扱えるのはCOMPLETEDの場合だけとする。
@@ -395,6 +396,7 @@ GET /api/streams/{streamId}/timeline
 コメントがない区間も省略せず、`commentCount`と`commentsPerMinute`を`0`として返す。
 部分区間の`commentsPerMinute`は、
 `commentCount * 60 / (endAt - startAtの秒数)`で1分あたりに換算する。
+計算途中では丸めず、APIレスポンス生成時に小数第1位へ四捨五入して返す。
 全体平均およびタイムラインは同じ`analysisStartAt`と`analysisEndAt`を使用する。
 `analysisStatus`がCOMPLETEDになるまではタイムラインを暫定値として扱う。
 FAILEDの場合は収集済み範囲の部分的なタイムラインであり、確定済み結果として扱わない。

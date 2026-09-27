@@ -224,7 +224,8 @@ averageCommentLength
 
 空文字のコメントは文字数`0`として分子へ加算し、1コメントとして分母に含める。
 `totalComments`が`0`の場合は`averageCommentLength`を`0`とする。
-計算途中では丸めず、保存およびAPI返却時に小数第1位へ四捨五入する。
+計算途中およびDB保存時は`NUMERIC(20,6)`の精度を保持し、
+API返却時に小数第1位へ四捨五入する。
 
 ---
 
@@ -711,13 +712,359 @@ SQSメッセージの冪等処理を実現するための処理管理情報と�
 `collection_job_batches`はSQS送信前に登録済みのバッチと分析完了済みバッチを突合し、
 終了後の分析確定を開始できるか判定するための処理管理情報として保存する。
 
+### 8.1. DB共通物理設計方針
+
+#### 8.1.1. 命名規則
+
+Aurora PostgreSQLの物理名には以下の規則を適用する。
+
+| 対象 | 規則 |
+| --- | --- |
+| Table | snake_case、複数形 |
+| Column | snake_case |
+| Surrogate Primary Key | `id` |
+| Foreign Key Column | `<entity>_id` |
+| Timestamp | `*_at` |
+| Primary Key Constraint | `pk_<table>` |
+| Unique Constraint | `uq_<table>_<columns>` |
+| Foreign Key Constraint | `fk_<table>_<referenced_table>` |
+| Check Constraint | `ck_<table>_<meaning>` |
+| Index | `idx_<table>_<columns>` |
+
+PostgreSQLでquoted identifierが必要となる名称は使用しない。
+APIおよび論理モデルでcamelCaseを使用する項目も、DB物理名ではsnake_caseとする。
+
+#### 8.1.2. ID方針
+
+Surrogate IDには`BIGINT GENERATED ALWAYS AS IDENTITY`を使用する。
+対象は`channels.id`、`streams.id`および`collection_jobs.id`とする。
+
+UUIDは使用せず、YouTube等の外部サービス由来IDも内部Primary Keyとして流用しない。
+外部IDは内部IDと分離して保持する。
+
+#### 8.1.3. 文字列型
+
+以下の値は原則として`TEXT`で保持し、外部仕様へ不要な`VARCHAR`長制限を持ち込まない。
+
+- YouTube Channel ID
+- YouTube Video ID
+- YouTube Live Chat ID
+- YouTube Comment ID
+- Step Functions Execution ARN
+- S3オブジェクトキー
+- `batchId`
+- URL
+
+URLにはUnique Constraintを設定しない。
+
+#### 8.1.4. Timestamp方針
+
+日時はすべて`TIMESTAMPTZ`で保持し、DB内ではUTCとして扱う。
+
+DBへの登録時刻を表す以下のColumnには`DEFAULT CURRENT_TIMESTAMP`を設定する。
+
+- `created_at`
+- INSERT時の`updated_at`
+- `registered_at`
+- `processed_at`
+- `schema_migrations.applied_at`
+
+YouTube配信開始・終了日時、収集開始・停止日時、観測開始日時、分析開始・終了日時および
+分析確定日時は外部システムまたはワークフローが決定するため、DEFAULTを設定しない。
+
+`updated_at`を自動更新するDB Triggerは作成しない。
+INSERT時は`DEFAULT CURRENT_TIMESTAMP`を使用し、UPDATE時はwriterが
+`updated_at = CURRENT_TIMESTAMP`を明示する。
+
+#### 8.1.5. 数値型
+
+| 値 | PostgreSQL Data Type |
+| --- | --- |
+| 内部ID | `BIGINT` |
+| コメント件数 | `BIGINT` |
+| 取得件数 | `BIGINT` |
+| Rank | `INTEGER` |
+| `min_length` / `max_length` | `INTEGER` |
+| Migration Version | `INTEGER` |
+| 平均コメント文字数 | `NUMERIC(20,6)` |
+| コメント速度 | `NUMERIC(20,6)` |
+
+平均値および速度は、複数batchの処理による丸め誤差の蓄積を避けるため、
+DB内部の計算および保存では`NUMERIC(20,6)`の精度を保持する。
+APIレスポンスでは必要に応じて小数第1位へ四捨五入する。
+
+#### 8.1.6. Status
+
+PostgreSQL ENUMは使用せず、`TEXT`とCheck Constraintを組み合わせる。
+StatusにはDEFAULTを設定せず、処理開始側が明示的に値を指定する。
+
+| Column | 許可値 |
+| --- | --- |
+| `collection_status` | `RUNNING` / `COMPLETED` / `FAILED` |
+| `analysis_status` | `PENDING` / `FINALIZING` / `COMPLETED` / `FAILED` |
+
+### 8.2. Application / Analysis Data物理定義
+
+#### 8.2.1. `channels`
+
+| Column | Type | Null | Default | Constraint | Description |
+| --- | --- | --- | --- | --- | --- |
+| `id` | `BIGINT GENERATED ALWAYS AS IDENTITY` | NOT NULL | identity | `pk_channels` Primary Key | 内部Channel ID |
+| `youtube_channel_id` | `TEXT` | NOT NULL | - | `uq_channels_youtube_channel_id` Unique | YouTube Channel ID |
+| `name` | `TEXT` | NOT NULL | - | - | チャンネル名 |
+| `url` | `TEXT` | NOT NULL | - | - | チャンネルURL |
+| `created_at` | `TIMESTAMPTZ` | NOT NULL | `CURRENT_TIMESTAMP` | - | 作成日時 |
+| `updated_at` | `TIMESTAMPTZ` | NOT NULL | `CURRENT_TIMESTAMP` | - | 更新日時。UPDATE時はwriterが明示更新する |
+
+URLにはUnique Constraintを設定しない。
+
+#### 8.2.2. `streams`
+
+| Column | Type | Null | Default | Constraint | Description |
+| --- | --- | --- | --- | --- | --- |
+| `id` | `BIGINT GENERATED ALWAYS AS IDENTITY` | NOT NULL | identity | `pk_streams` Primary Key | 内部Stream ID |
+| `youtube_video_id` | `TEXT` | NOT NULL | - | `uq_streams_youtube_video_id` Unique | YouTube Video ID |
+| `youtube_live_chat_id` | `TEXT` | NOT NULL | - | - | YouTube Live Chat ID |
+| `channel_id` | `BIGINT` | NOT NULL | - | `fk_streams_channels` Foreign Key | `channels.id` |
+| `title` | `TEXT` | NOT NULL | - | - | 配信タイトル |
+| `started_at` | `TIMESTAMPTZ` | NOT NULL | - | - | YouTubeの実開始日時 |
+| `ended_at` | `TIMESTAMPTZ` | NULL | - | `ck_streams_time_range` Check | YouTubeの実終了日時。未取得時はNULL |
+| `url` | `TEXT` | NOT NULL | - | - | 配信URL |
+| `created_at` | `TIMESTAMPTZ` | NOT NULL | `CURRENT_TIMESTAMP` | - | 作成日時 |
+| `updated_at` | `TIMESTAMPTZ` | NOT NULL | `CURRENT_TIMESTAMP` | - | 更新日時。UPDATE時はwriterが明示更新する |
+
+- `fk_streams_channels`: `channel_id` → `channels.id`、`ON DELETE RESTRICT`
+- `ck_streams_time_range`: `ended_at IS NULL OR ended_at >= started_at`
+- Live Chat IDおよびURLにはUnique Constraintを設定しない
+
+#### 8.2.3. `stream_metrics`
+
+| Column | Type | Null | Default | Constraint | Description |
+| --- | --- | --- | --- | --- | --- |
+| `stream_id` | `BIGINT` | NOT NULL | - | `pk_stream_metrics` Primary Key、`fk_stream_metrics_streams` Foreign Key | 対象Stream |
+| `total_comments` | `BIGINT` | NOT NULL | `0` | `ck_stream_metrics_total_comments` Check | Analyzerが実際に分析対象としたコメント件数 |
+| `average_comment_length` | `NUMERIC(20,6)` | NOT NULL | `0` | `ck_stream_metrics_average_length` Check | 平均コメント文字数 |
+| `average_comments_per_minute` | `NUMERIC(20,6)` | NOT NULL | `0` | `ck_stream_metrics_average_velocity` Check | 平均コメント速度 |
+| `analysis_start_at` | `TIMESTAMPTZ` | NOT NULL | - | - | 分析対象開始日時 |
+| `analysis_end_at` | `TIMESTAMPTZ` | NULL | - | `ck_stream_metrics_time_range` Check | 分析基準日時。未確定時はNULL |
+
+- 独立した`id`は作成しない
+- `fk_stream_metrics_streams`: `stream_id` → `streams.id`、`ON DELETE RESTRICT`
+- `ck_stream_metrics_total_comments`: `total_comments >= 0`
+- `ck_stream_metrics_average_length`: `average_comment_length >= 0`
+- `ck_stream_metrics_average_velocity`: `average_comments_per_minute >= 0`
+- `ck_stream_metrics_time_range`: `analysis_end_at IS NULL OR analysis_end_at >= analysis_start_at`
+
+#### 8.2.4. `comment_timeline`
+
+| Column | Type | Null | Default | Constraint | Description |
+| --- | --- | --- | --- | --- | --- |
+| `stream_id` | `BIGINT` | NOT NULL | - | `pk_comment_timeline` Primary Key、`fk_comment_timeline_streams` Foreign Key | 対象Stream |
+| `start_at` | `TIMESTAMPTZ` | NOT NULL | - | `pk_comment_timeline` Primary Key | 区間開始日時 |
+| `end_at` | `TIMESTAMPTZ` | NOT NULL | - | `ck_comment_timeline_time_range` Check | 区間終了日時 |
+| `comment_count` | `BIGINT` | NOT NULL | `0` | `ck_comment_timeline_count` Check | 区間内コメント数 |
+| `comments_per_minute` | `NUMERIC(20,6)` | NOT NULL | `0` | `ck_comment_timeline_velocity` Check | 1分あたりコメント速度 |
+
+- `pk_comment_timeline`: (`stream_id`, `start_at`)
+- `fk_comment_timeline_streams`: `stream_id` → `streams.id`、`ON DELETE RESTRICT`
+- `ck_comment_timeline_time_range`: `end_at > start_at`
+- `ck_comment_timeline_count`: `comment_count >= 0`
+- `ck_comment_timeline_velocity`: `comments_per_minute >= 0`
+
+#### 8.2.5. `comment_length_distribution`
+
+| Column | Type | Null | Default | Constraint | Description |
+| --- | --- | --- | --- | --- | --- |
+| `stream_id` | `BIGINT` | NOT NULL | - | `pk_comment_length_distribution` Primary Key、`fk_comment_length_distribution_streams` Foreign Key | 対象Stream |
+| `min_length` | `INTEGER` | NOT NULL | - | `pk_comment_length_distribution` Primary Key、`ck_comment_length_distribution_min` Check | 区間下限 |
+| `max_length` | `INTEGER` | NULL | - | `ck_comment_length_distribution_range` Check | 区間上限。NULLは上限なしを表す |
+| `comment_count` | `BIGINT` | NOT NULL | `0` | `ck_comment_length_distribution_count` Check | 区間内コメント数 |
+
+- `pk_comment_length_distribution`: (`stream_id`, `min_length`)
+- `fk_comment_length_distribution_streams`: `stream_id` → `streams.id`、`ON DELETE RESTRICT`
+- `ck_comment_length_distribution_min`: `min_length >= 0`
+- `ck_comment_length_distribution_range`: `max_length IS NULL OR max_length >= min_length`
+- `ck_comment_length_distribution_count`: `comment_count >= 0`
+
+#### 8.2.6. `frequent_words`
+
+| Column | Type | Null | Default | Constraint | Description |
+| --- | --- | --- | --- | --- | --- |
+| `stream_id` | `BIGINT` | NOT NULL | - | `pk_frequent_words` Primary Key、`fk_frequent_words_streams` Foreign Key | 対象Stream |
+| `word` | `TEXT` | NOT NULL | - | `pk_frequent_words` Primary Key、`ck_frequent_words_word` Check | 正規化済み単語 |
+| `count` | `BIGINT` | NOT NULL | - | `ck_frequent_words_count` Check | 出現回数 |
+| `rank` | `INTEGER` | NOT NULL | - | `uq_frequent_words_stream_id_rank` Unique、`ck_frequent_words_rank` Check | 順位 |
+
+- `pk_frequent_words`: (`stream_id`, `word`)
+- `uq_frequent_words_stream_id_rank`: (`stream_id`, `rank`)、`DEFERRABLE INITIALLY DEFERRED`
+- `fk_frequent_words_streams`: `stream_id` → `streams.id`、`ON DELETE RESTRICT`
+- `ck_frequent_words_word`: `word <> ''`
+- `ck_frequent_words_count`: `count > 0`
+- `ck_frequent_words_rank`: `rank > 0`
+
+Rankの入替えを含むランキング再計算を一つのTransaction内で行えるよう、
+`uq_frequent_words_stream_id_rank`はTransaction終了時に検証する。
+
+#### 8.2.7. `collection_jobs`
+
+| Column | Type | Null | Default | Constraint | Description |
+| --- | --- | --- | --- | --- | --- |
+| `id` | `BIGINT GENERATED ALWAYS AS IDENTITY` | NOT NULL | identity | `pk_collection_jobs` Primary Key | 内部Collection Job ID |
+| `stream_id` | `BIGINT` | NOT NULL | - | `uq_collection_jobs_stream_id` Unique、`fk_collection_jobs_streams` Foreign Key | PoCでは1 Streamにつき1 Job |
+| `execution_arn` | `TEXT` | NOT NULL | - | `uq_collection_jobs_execution_arn` Unique | Step Functions Execution ARN |
+| `collection_started_at` | `TIMESTAMPTZ` | NOT NULL | - | - | 収集開始日時 |
+| `observation_started_at` | `TIMESTAMPTZ` | NULL | - | - | 初回の正常なコメント取得要求の開始日時 |
+| `collection_stopped_at` | `TIMESTAMPTZ` | NULL | - | `ck_collection_jobs_stop_time` Check | 収集停止日時。継続中はNULL |
+| `collection_status` | `TEXT` | NOT NULL | - | `ck_collection_jobs_collection_status` Check | 収集状態 |
+| `analysis_status` | `TEXT` | NOT NULL | - | `ck_collection_jobs_analysis_status` Check | 分析状態 |
+| `last_page_token` | `TEXT` | NULL | - | - | Collection Jobが最後に観測した取得位置 |
+| `collected_comment_count` | `BIGINT` | NOT NULL | `0` | `ck_collection_jobs_collected_count` Check | YouTube APIから取得したコメント件数 |
+| `stop_reason` | `TEXT` | NULL | - | - | 収集停止理由 |
+| `error_code` | `TEXT` | NULL | - | - | 機密情報を含まないエラー種別 |
+| `analysis_finalized_at` | `TIMESTAMPTZ` | NULL | - | - | Analysis Finalizerによる分析確定日時 |
+
+- `fk_collection_jobs_streams`: `stream_id` → `streams.id`、`ON DELETE RESTRICT`
+- `ck_collection_jobs_collection_status`: `collection_status IN ('RUNNING', 'COMPLETED', 'FAILED')`
+- `ck_collection_jobs_analysis_status`: `analysis_status IN ('PENDING', 'FINALIZING', 'COMPLETED', 'FAILED')`
+- `ck_collection_jobs_collected_count`: `collected_comment_count >= 0`
+- `ck_collection_jobs_stop_time`: `collection_stopped_at IS NULL OR collection_stopped_at >= collection_started_at`
+
+`last_page_token`は監査・障害調査用であり、Data Collectorの継続制御には使用しない。
+継続制御に使用する`nextPageToken`はStep Functionsの実行状態を正とする。
+
+`collection_jobs.collected_comment_count`はCollection JobがYouTube APIから取得したコメント件数、
+`stream_metrics.total_comments`はAnalyzerが実際に分析対象としたコメント件数である。
+両者は意味が異なるため、同一値であることをDB Constraintで要求しない。
+
+#### 8.2.8. `collection_job_batches`
+
+| Column | Type | Null | Default | Constraint | Description |
+| --- | --- | --- | --- | --- | --- |
+| `collection_job_id` | `BIGINT` | NOT NULL | - | `pk_collection_job_batches` Primary Key、`fk_collection_job_batches_collection_jobs` Foreign Key | 対象Collection Job |
+| `batch_id` | `TEXT` | NOT NULL | - | `pk_collection_job_batches` Primary Key、`ck_collection_job_batches_batch_id` Check | 決定的に生成したBatch ID |
+| `outbox_object_key` | `TEXT` | NOT NULL | - | - | S3 Outboxオブジェクトキー |
+| `payload_sha256` | `CHAR(64)` | NOT NULL | - | `ck_collection_job_batches_sha256` Check | Payloadの小文字hex SHA-256 |
+| `registered_at` | `TIMESTAMPTZ` | NOT NULL | `CURRENT_TIMESTAMP` | - | 送信予定登録日時 |
+
+- `pk_collection_job_batches`: (`collection_job_id`, `batch_id`)
+- `fk_collection_job_batches_collection_jobs`: `collection_job_id` → `collection_jobs.id`、`ON DELETE RESTRICT`
+- `ck_collection_job_batches_batch_id`: `batch_id ~ '^batch-v1-[0-9a-f]{64}$'`
+- `ck_collection_job_batches_sha256`: `payload_sha256 ~ '^[0-9a-f]{64}$'`
+
+#### 8.2.9. `processed_comment_batches`
+
+| Column | Type | Null | Default | Constraint | Description |
+| --- | --- | --- | --- | --- | --- |
+| `batch_id` | `TEXT` | NOT NULL | - | `pk_processed_comment_batches` Primary Key、`ck_processed_comment_batches_batch_id` Check | 処理済みBatch ID |
+| `stream_id` | `BIGINT` | NOT NULL | - | `fk_processed_comment_batches_streams` Foreign Key | 対象Stream |
+| `processed_at` | `TIMESTAMPTZ` | NOT NULL | `CURRENT_TIMESTAMP` | - | 処理日時 |
+
+- 独立した`id`は作成しない
+- `fk_processed_comment_batches_streams`: `stream_id` → `streams.id`、`ON DELETE RESTRICT`
+- `ck_processed_comment_batches_batch_id`: `batch_id ~ '^batch-v1-[0-9a-f]{64}$'`
+
+#### 8.2.10. `processed_comments`
+
+| Column | Type | Null | Default | Constraint | Description |
+| --- | --- | --- | --- | --- | --- |
+| `stream_id` | `BIGINT` | NOT NULL | - | `pk_processed_comments` Primary Key、`fk_processed_comments_streams` Foreign Key | 対象Stream |
+| `comment_id` | `TEXT` | NOT NULL | - | `pk_processed_comments` Primary Key | YouTube Comment ID |
+| `processed_at` | `TIMESTAMPTZ` | NOT NULL | `CURRENT_TIMESTAMP` | - | 処理日時 |
+
+- `pk_processed_comments`: (`stream_id`, `comment_id`)
+- `fk_processed_comments_streams`: `stream_id` → `streams.id`、`ON DELETE RESTRICT`
+- `comment_id`単独のIndexは作成しない
+
+### 8.3. Migration管理テーブル
+
+`schema_migrations`はアプリケーションデータと分離し、Migrationの適用履歴と改変検知に使用する。
+
+#### 8.3.1. `schema_migrations`
+
+| Column | Type | Null | Default | Constraint | Description |
+| --- | --- | --- | --- | --- | --- |
+| `version` | `INTEGER` | NOT NULL | - | `pk_schema_migrations` Primary Key、`ck_schema_migrations_version` Check | Migration Version |
+| `name` | `TEXT` | NOT NULL | - | - | Migration名 |
+| `checksum` | `CHAR(64)` | NOT NULL | - | `ck_schema_migrations_checksum` Check | Migration内容の小文字hex SHA-256 |
+| `applied_at` | `TIMESTAMPTZ` | NOT NULL | `CURRENT_TIMESTAMP` | - | 適用日時 |
+
+- 独立した`id`は作成しない
+- `name`および`checksum`にUnique Constraintを設定しない
+- Primary Key以外のIndexを作成しない
+- `ck_schema_migrations_version`: `version > 0`
+- `ck_schema_migrations_checksum`: `checksum ~ '^[0-9a-f]{64}$'`
+
+#### 8.3.2. Migration Version規則
+
+Migration directoryは`<version>_<name>`形式とする。
+
+```text
+001_initial_schema
+002_add_xxx
+003_add_xxx
+1000_add_yyy
+```
+
+- directory名先頭の連続する10進数部分をVersionとする
+- 最初の`_`以降をMigration Nameとする
+- DBにはVersionを整数で保存し、`001`は`1`として扱う
+- Versionは正の`INTEGER`とし、重複を禁止する
+- MigrationはVersionの数値昇順で適用する
+- 適用済みVersionのSQLは変更しない
+- SQL内容を変更する場合は新しいVersionを追加する
+- Semantic Versioningは使用しない
+- Checksumによって適用済みMigrationの改変を検知する
+- 先頭3桁固定ではなく、`1000_xxx`以降も同じ規則で扱う
+
+### 8.4. Foreign Key / ON DELETE方針
+
+すべてのForeign Keyに`ON DELETE RESTRICT`を設定する。
+
+- Channel、StreamおよびCollection Jobを物理削除する現行ユースケースは存在しない
+- 分析結果や収集履歴の誤った連鎖削除を防止する
+- 将来物理削除を導入する場合は、削除順序と保持方針を明示的に設計する
+
+`ON DELETE CASCADE`は使用しない。
+
+### 8.5. Index方針
+
+初期物理設計では追加のnon-unique Indexを作成せず、Primary KeyおよびUnique Constraintにより
+作成されるIndexを利用する。
+
+以下のIndexは初期物理設計では追加しない。
+
+| Index候補 | 追加しない理由 |
+| --- | --- |
+| `streams(started_at DESC, id DESC)` | `/streams`の並び順、Pagination方式およびQuery Patternが未確定 |
+| `streams(channel_id)` | Channel単位検索および物理削除の現行Query Patternがない |
+| `streams(youtube_live_chat_id)` | DBでLive Chat IDを検索する現行Query Patternがない |
+| `collection_job_batches(batch_id)` | Finalizerは`collection_job_id`で対象Jobを限定して突合する |
+| `processed_comment_batches(stream_id)` | 冪等性確認は`batch_id`を使用する |
+| `processed_comments(comment_id)` | 冪等性確認は(`stream_id`, `comment_id`)を使用する |
+
+`/streams`一覧用Indexは、API実装時に並び順、Pagination方式およびQuery Patternを確定してから追加を判断する。
+
+### 8.6. DB Check Constraintの境界
+
+以下はDB Check Constraintへ追加せず、アプリケーションまたは統合テストで検証する。
+
+- URL形式
+- YouTube IDの文字数および形式
+- ARN形式
+- S3オブジェクトキー形式
+- Status間の複雑な遷移規則
+- Comment Length Distributionの区間数
+- `analysis_finalized_at`とStatusの複雑な相関
+
 ---
 
 ## 9. データベース設計方針
 
 ### 9.1. 主キー
 
-各エンティティに内部IDを付与する。
+Surrogate IDは`channels`、`streams`および`collection_jobs`にのみ付与する。
+その他のテーブルは、データ特性と冪等性要件に基づき、
+8.2節および8.3節で定義した単一または複合Primary Keyを使用する。
 
 YouTube API上のIDは外部IDとして保持する。
 

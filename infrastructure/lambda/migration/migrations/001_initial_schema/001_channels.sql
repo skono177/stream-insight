@@ -1,0 +1,10 @@
+CREATE TABLE channels (
+  id BIGINT GENERATED ALWAYS AS IDENTITY,
+  youtube_channel_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  url TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT pk_channels PRIMARY KEY (id),
+  CONSTRAINT uq_channels_youtube_channel_id UNIQUE (youtube_channel_id)
+);
