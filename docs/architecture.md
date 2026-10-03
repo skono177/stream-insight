@@ -160,8 +160,8 @@ Step Functionsの実行状態には主に以下の情報を保持する。
 ```text
 streamId
 collectionJobId
-videoId
-liveChatId
+youtubeVideoId
+youtubeLiveChatId
 nextPageToken
 pollingInterval
 observationStartedAt
@@ -180,7 +180,7 @@ Start
 Get Stream Metadata
 (Data Collector Lambda)
   ↓
-Persist Stream Metadata
+START_COLLECTION
 (Stream Metadata Lambda)
   ↓
 internal streamId取得
@@ -190,7 +190,7 @@ Collect Comments
   ↓
 S3 OutboxへPayload保存
   ↓
-Register Outbox Batch
+REGISTER_BATCHES
 (Stream Metadata Lambda)
   ↓
 SQSへ送信
@@ -203,7 +203,7 @@ nextPageToken取得
   │   ↓
   │  Get Final Stream Metadata (Data Collector Lambda)
   │   ↓
-  │  Persist Final Metadata / Collection Status (Stream Metadata Lambda)
+  │  STOP_COLLECTION (Stream Metadata Lambda)
   │   ↓
   │  collectionStatus?
   │    ├─ FAILED → analysisStatus=FAILED → Fail
@@ -260,12 +260,12 @@ YouTube Data APIから対象配信のデータを取得する。
 収集開始時には、以下の配信メタデータをStep Functionsへ返却する。
 
 ```text
-videoId
-channelId
-channelTitle
+youtubeVideoId
+youtubeChannelId
+channelName
 title
 startedAt
-liveChatId
+youtubeLiveChatId
 ```
 
 Data Collector Lambda自身では配信メタデータをAuroraへ保存しない。
@@ -317,68 +317,278 @@ Auroraへ直接接続せず、VPC外で実行する構成を基本とする。
 
 ### 4.4. Stream Metadata Lambda
 
-Data Collector Lambdaが取得した配信メタデータを
-Aurora PostgreSQLへ永続化する。
+Stream Metadata Lambdaは、Data Collector Lambdaが取得し、Step Functionsが保持する
+配信・収集処理情報をAurora PostgreSQLへ永続化する。
+YouTube API、S3およびSQSへは直接アクセスしない。
 
 主な責務：
 
 - YouTube Channel IDを外部IDとして`channels`を作成または更新
 - YouTube Video IDを外部IDとして`streams`を作成または更新
-- 内部`channelId`の採番・取得
-- 内部`streamId`の採番・取得
-- 内部`streamId`および`collectionJobId`をStep Functionsへ返却
-- SQS送信前の`batchId`、OutboxオブジェクトキーおよびPayload SHA-256の`collection_job_batches`への冪等登録
-- `collection_jobs.observationStartedAt`および`stream_metrics.analysisStartAt`の初回保存
 - `collection_jobs`の開始登録および終了状態更新
-- 終了時の`streams.endedAt`を含む最終メタデータ更新
+- `collection_jobs.observation_started_at`および`stream_metrics.analysis_start_at`の初回保存
+- SQS送信前の`collection_job_batches`への冪等登録
+- 終了時の`streams.ended_at`を含む最終メタデータ更新
+- Analysis Finalizerの再試行上限到達時に`analysis_status=FAILED`を記録
+- 内部`streamId`および`collectionJobId`をStep Functionsへ返却
 
-配信メタデータの永続化はコメント収集開始前および収集終了時に実行する。
-開始時にStep Functions Execution ARNを一意キーとして`collection_jobs`を登録し、
-終了時は同じ実行のレコードを更新する。
+Data Collector LambdaはYouTube APIからメタデータとコメントを取得し、S3 Outboxへの保存と
+登録済みPayloadのSQS送信を担当する。Step FunctionsはExecution ARN、取得位置、累積件数、
+開始・停止時刻および処理状態を実行状態として保持し、適切なOperationで本Lambdaを呼び出す。
+Analyzer Lambdaはコメント分析結果と処理済み情報を更新する。Analysis Finalizer Lambdaは
+未処理バッチの確認、分析結果の確定、`analysis_status=COMPLETED`および
+`analysis_finalized_at`の更新を同一トランザクションで担当する。
 
-PoCでは1配信につき収集ジョブを1件に限定する。
-`collection_jobs.streamId`にも一意制約を設定し、既存ジョブがある配信への別Executionの開始は
-状態がFAILEDであっても拒否する。同じExecution ARNの再試行は既存ジョブを再利用する。
-これにより配信単位の集計・処理済み情報と別ジョブのバッチが混在しない。
-開始登録は配信情報の作成・更新と同一トランザクションで行い、一意制約違反時は開始を失敗させる。
-同一配信の再収集を可能にする場合は、ジョブ単位の集計・重複排除・確定条件を別途設計する。
+#### 4.4.1. 共通Contract
 
-コメントバッチの登録はSQS送信前に行い、同じ登録要求の再実行では既存行を返す。
-同じ`collectionJobId`と`batchId`に異なるオブジェクトキーまたはPayload SHA-256が指定された場合は、
-既存行を上書きせずエラーとする。
+入力は`operation`を持つplain JSON objectとし、API Gateway形式の`statusCode` / `body`は使用しない。
+Operationは以下の4種類とする。
 
-初回の正常な取得後、Outbox登録要求と同じStream Metadata Lambda呼び出しで
-`observationStartedAt`を`collection_jobs`へ保存し、
-`streams.startedAt`と`observationStartedAt`の遅い方を`stream_metrics.analysisStartAt`へ設定する。
-取得コメントが0件で登録対象バッチがない場合も、この保存処理を実行する。
-再試行や後続取得では既存値を変更しない。
+| Operation | 呼び出し元 | 目的 |
+| --- | --- | --- |
+| `START_COLLECTION` | Step Functions | 配信メタデータとCollection Jobを開始登録する |
+| `REGISTER_BATCHES` | Step Functions | 観測開始時刻を初回保存し、SQS送信前のOutbox batchを登録する |
+| `STOP_COLLECTION` | Step Functions | 最終配信メタデータとCollection Jobの終了状態を保存する |
+| `MARK_ANALYSIS_FAILED` | Step FunctionsのFinalizer Catch | 分析確定失敗を記録する |
 
-終了時の`streams`更新と`collection_jobs`更新は同一Auroraトランザクションで確定する。
-同じ終了要求を再実行しても重複レコードを作成せず、確定済みの終了情報を消さない。
-Stream Metadata LambdaはYouTube APIを直接呼び出さず、Data Collectorから渡された必要項目だけを保存する。
+外部IDは`youtubeChannelId`、`youtubeVideoId`、`youtubeLiveChatId`、
+内部IDは`channelId`、`streamId`、`collectionJobId`と命名する。
+PostgreSQL `BIGINT`である内部IDおよびコメント件数は、Node.jsの安全整数範囲を超えても
+精度を失わないよう、Lambda Input / OutputおよびStep Functions stateでは10進JSON stringとする。
+値は`0`または先頭ゼロのある形式を許可せず、内部IDは`^[1-9][0-9]*$`、
+0を許容する件数は`^(0|[1-9][0-9]*)$`として検証する。
 
-同じYouTube Channel IDまたはVideo IDが既に登録されている場合は、
-既存レコードを利用し、重複レコードを作成しない。
+日時はUTCのRFC 3339文字列として受け取り、DBへは`TIMESTAMPTZ`として保存する。
+各Operationは定義された項目だけを受け取り、未知の項目、空文字、不正な日時、
+不正なIDおよびOperationごとの状態条件を満たさない入力をDB接続前に拒否する。
 
-概念的な処理：
+#### 4.4.2. `START_COLLECTION`
+
+Data Collectorが配信メタデータとLive Chat IDを取得した後、コメント収集開始前に
+Step Functionsが呼び出す。Live Chat IDが取得できない配信はコメント分析を実行できないため、
+PoCの分析開始対象外とし、このOperationを呼び出さない。
+
+Input：
+
+```json
+{
+  "operation": "START_COLLECTION",
+  "executionArn": "arn:aws:states:ap-northeast-1:123456789012:execution:stream-insight:example",
+  "collectionStartedAt": "2026-08-23T15:00:00Z",
+  "stream": {
+    "youtubeChannelId": "UCxxxxxxxxxxxxxxxxxxxxxx",
+    "channelName": "チャンネル名",
+    "youtubeVideoId": "youtube-video-id",
+    "youtubeLiveChatId": "youtube-live-chat-id",
+    "title": "配信タイトル",
+    "startedAt": "2026-08-23T14:58:00Z"
+  }
+}
+```
+
+Channel URLおよびStream URLは入力で受け取らず、検証済みの外部IDから本Lambdaが次の形式で生成する。
 
 ```text
-Stream Metadata
-      ↓
-YouTube Channel ID
-      ↓
-channels Upsert
-      ↓
-internal channelId
-      ↓
-YouTube Video ID
-      ↓
-streams Upsert
-      ↓
-internal streamId
-      ↓
-Step Functions
+channels.url = https://www.youtube.com/channel/<youtubeChannelId>
+streams.url  = https://www.youtube.com/watch?v=<youtubeVideoId>
 ```
+
+1つのトランザクションで次を実行する。
+
+1. `youtube_channel_id`を競合対象として`channels`をUPSERTし、内部`channelId`を取得する
+2. `youtube_video_id`を競合対象として`streams`をUPSERTし、内部`streamId`を取得する
+3. `execution_arn`および`stream_id`の一意制約を利用して`collection_jobs`を開始登録する
+4. `collection_status=RUNNING`、`analysis_status=PENDING`で内部`collectionJobId`を取得する
+
+同じYouTube Channel IDでは`name`、決定的に生成した`url`および`updated_at`を更新する。
+同じYouTube Video IDでは`title`、`started_at`、決定的に生成した`url`および`updated_at`を更新する。
+既存Streamの`channel_id`または`youtube_live_chat_id`が入力と異なる場合は、別の配信関係へ
+付け替えずデータ不整合としてトランザクションを失敗させる。開始処理では`ended_at`を更新せず、
+既存の確定済み終了日時を保持する。
+
+既存Channel / Streamの業務項目と入力から導出した業務項目が完全一致する再実行では、
+ChannelおよびStreamに対するUPDATE SQL自体を実行せず、`updated_at`も変更しない。
+既存行をそのまま使用して後続処理へ進む。上記の更新対象となる業務項目に実際の差分がある場合だけ、
+許可された業務項目をUPDATEし、同じUPDATEで`updated_at`を更新する。
+
+同じExecution ARNの再実行は、同じStreamおよび同じ`collectionStartedAt`である場合だけ
+既存Collection Jobを返す。同じStreamに別Execution ARNが存在する場合、または同じExecution ARNが
+別Stream・別開始時刻を指す場合は拒否する。PoCでは状態にかかわらず1 Streamにつき1 Jobとする。
+
+`analysis_start_at`は初回の正常なコメント取得時刻が未確定であるため、
+このOperationでは`stream_metrics`を作成しない。
+
+Output：
+
+```json
+{
+  "streamId": "1",
+  "collectionJobId": "1"
+}
+```
+
+#### 4.4.3. `REGISTER_BATCHES`
+
+Data Collectorがコメント取得要求を正常終了し、送信PayloadをS3 Outboxへ保存した後、
+SQS送信前にStep Functionsが呼び出す。初回取得が0件で`batches`が空の場合も呼び出す。
+
+Input：
+
+```json
+{
+  "operation": "REGISTER_BATCHES",
+  "streamId": "1",
+  "collectionJobId": "1",
+  "executionArn": "arn:aws:states:ap-northeast-1:123456789012:execution:stream-insight:example",
+  "observationStartedAt": "2026-08-23T15:00:20Z",
+  "batches": [
+    {
+      "batchId": "batch-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "outboxObjectKey": "outbox/1/batch-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.json",
+      "payloadSha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+    }
+  ]
+}
+```
+
+同一Request内の`batchId`重複は入力不正とする。1つのトランザクションで対象Collection Jobを
+行ロックし、`streamId`、`collectionJobId`、`executionArn`の対応と`RUNNING`状態を確認して次を行う。
+
+1. `observation_started_at`がNULLなら入力値を保存し、既存値がある場合は同じ値であることを確認する
+2. `analysis_start_at = max(streams.started_at, observation_started_at)`として`stream_metrics`を初回作成する
+3. 各Descriptorを`collection_job_batches`へ登録する
+
+`stream_metrics`が既に存在する場合は`analysis_start_at`が同じことを確認し、変更しない。
+Batchは`(collection_job_id, batch_id)`を競合対象として登録する。同じキー・同じ
+`outbox_object_key`・同じ`payload_sha256`の再登録は成功とするが、どちらかが異なる場合は
+既存行を上書きせず、Payload同一性違反としてトランザクション全体を失敗させる。
+
+Output：
+
+```json
+{
+  "registeredBatchCount": 1
+}
+```
+
+`registeredBatchCount`は新規行数ではなく、同一性を確認して今回の要求で登録済みとなったDescriptor数とする。
+
+#### 4.4.4. `STOP_COLLECTION`
+
+配信またはLive Chatの終了を検知し、Data Collectorが最終メタデータを取得した後、
+Step Functionsが呼び出す。Step Functionsは`collectionStoppedAt`を一度だけ確定し、
+再試行でも同じ値と累積件数を渡す。
+
+Input：
+
+```json
+{
+  "operation": "STOP_COLLECTION",
+  "streamId": "1",
+  "collectionJobId": "1",
+  "executionArn": "arn:aws:states:ap-northeast-1:123456789012:execution:stream-insight:example",
+  "youtubeVideoId": "youtube-video-id",
+  "title": "最終配信タイトル",
+  "startedAt": "2026-08-23T14:58:00Z",
+  "endedAt": "2026-08-23T17:00:00Z",
+  "collectionStoppedAt": "2026-08-23T17:00:10Z",
+  "collectionStatus": "COMPLETED",
+  "lastPageToken": null,
+  "collectedCommentCount": "1200",
+  "stopReason": "STREAM_ENDED",
+  "errorCode": null
+}
+```
+
+`collectionStatus`は`COMPLETED`または`FAILED`だけを許可する。`COMPLETED`では`endedAt`を必須、
+`errorCode`をNULLとし、`FAILED`では機密情報を含まない`errorCode`を必須とする。
+`stopReason`は両状態で必須とする。`endedAt`はFAILEDの場合だけNULLを許容する。
+
+1つのトランザクションで対象Collection Jobを行ロックし、内部ID、Execution ARNおよび
+YouTube Video IDの対応を確認して、`streams`の最終メタデータと`collection_jobs`の終了状態を更新する。
+`COMPLETED`へ更新するには`observation_started_at`と`stream_metrics`が存在することも確認する。
+取得系列に欠落がないことおよび全登録済みOutbox PayloadのSQS送信が成功したことは、
+Step Functionsが確認したうえで`COMPLETED`を指定する。
+
+`COMPLETED`では`analysis_status=FINALIZING`、`FAILED`では`analysis_status=FAILED`とする。
+`analysis_finalized_at`は更新しない。`title`と`started_at`は最終取得値で更新する。
+`endedAt=NULL`で既存の非NULL値を消さず、既存値がNULLなら非NULLの実終了日時を保存する。
+既存の非NULL終了日時と異なる非NULL値は不整合として拒否する。
+
+許可する状態遷移は`RUNNING → COMPLETED`または`RUNNING → FAILED`だけとする。
+終端状態への再実行では、入力`youtubeVideoId`が保存済み`streams.youtube_video_id`と一致し、
+`title`、`startedAt`、`endedAt`、`collectionStoppedAt`、`collectionStatus`、`lastPageToken`、
+`collectedCommentCount`、`stopReason`および`errorCode`も保存済みの値と一致する場合だけ成功とする。
+いずれかが相違する場合は`STATE_CONFLICT`として拒否する。
+終端状態を別の状態へ変更せず、FAILEDをCOMPLETEDへ、COMPLETEDをFAILEDへ変更しない。
+終了日時未取得でFAILEDとなったJobの復旧実行では、他の終端情報を保持したまま
+`ended_at`だけをNULLから実終了日時へ補完できる。この補完を終端状態への再実行における唯一の例外とする。
+
+Output：
+
+```json
+{
+  "streamId": "1",
+  "collectionJobId": "1",
+  "collectionStatus": "COMPLETED",
+  "analysisStatus": "FINALIZING"
+}
+```
+
+#### 4.4.5. `MARK_ANALYSIS_FAILED`
+
+Analysis FinalizerのRetry上限到達または分析完了待ちのtimeoutをStep FunctionsがCatchした場合に呼び出す。
+
+Input：
+
+```json
+{
+  "operation": "MARK_ANALYSIS_FAILED",
+  "streamId": "1",
+  "collectionJobId": "1",
+  "executionArn": "arn:aws:states:ap-northeast-1:123456789012:execution:stream-insight:example",
+  "errorCode": "ANALYSIS_FINALIZATION_TIMEOUT"
+}
+```
+
+1つのトランザクションで対象Collection Jobを行ロックし、IDとExecution ARNの対応を確認する。
+収集中のJobは拒否する。`analysis_status`がPENDINGまたはFINALIZINGならFAILEDへ更新し、
+機密情報を含まない`error_code`を保存する。既にFAILEDなら再実行を成功とし、最初のエラー種別を保持する。
+既にCOMPLETEDならDBを更新せず、`analysis_status`をFAILEDへ戻さず、`error_code`も上書きしない。
+この場合は現在のCOMPLETED状態を返す。
+`analysis_finalized_at`はAnalysis Finalizerによる正常確定時刻であるため、このOperationでは設定しない。
+
+Outputの`analysisStatus`は`"FAILED"`または`"COMPLETED"`とし、処理後の実際の保存状態を返す。
+
+PENDING、FINALIZINGまたはFAILEDの場合：
+
+```json
+{
+  "streamId": "1",
+  "collectionJobId": "1",
+  "analysisStatus": "FAILED"
+}
+```
+
+COMPLETEDの場合：
+
+```json
+{
+  "streamId": "1",
+  "collectionJobId": "1",
+  "analysisStatus": "COMPLETED"
+}
+```
+
+#### 4.4.6. Transactionとエラー
+
+各Operationは1つのAuroraトランザクションで完結させる。途中失敗時は全変更をRollbackし、
+部分状態を残さない。冪等性はPrimary Key、Unique Constraint、`INSERT ... ON CONFLICT`、
+行ロックおよび状態遷移条件で保証し、事前SELECTだけに依存しない。
+
+Commit開始前の失敗ではRollbackする。Commit要求後に応答を確認できない場合は結果不明として
+Rollbackせず、接続を破棄して再試行可能エラーを返す。呼び出し元は同じ入力を再実行し、
+各Operationの冪等性によって保存済みまたは未保存のどちらでも同じ結果へ収束させる。
 
 Stream Metadata LambdaはAuroraへアクセスするためVPC内へ配置する。
 
@@ -405,7 +615,7 @@ SQSへ送信するコメントデータには内部`streamId`、`collectionJobId
 batchId
 streamId
 collectionJobId
-videoId
+youtubeVideoId
 comments
 ```
 
@@ -565,7 +775,7 @@ Analysis Finalizerは`collection_jobs.collectionStatus=COMPLETED`の場合だけ
 確定処理は一つのAuroraトランザクションで冪等に実行する。
 未処理バッチが残っている場合は更新せず、Step FunctionsへPENDINGを返す。
 FinalizerのRetry上限到達時はStep FunctionsのCatchからStream Metadata Lambdaの
-失敗状態更新モードを呼び出し、対象`collectionJobId`の`analysisStatus=FAILED`を冪等に保存する。
+`MARK_ANALYSIS_FAILED`を呼び出し、対象`collectionJobId`の`analysisStatus=FAILED`を冪等に保存する。
 この更新はFinalizerとは別のTaskとして再試行する。
 既にCOMPLETEDのジョブはFAILEDへ戻さない。
 
@@ -721,7 +931,7 @@ AuroraトランザクションのCommit後にSQSメッセージが再配信さ�
 ### 5.4. 分析完了待ち・確定
 
 ```text
-Persist Final Metadata
+STOP_COLLECTION
         ↓
 Analysis Finalizer Lambda
         ↓
@@ -839,8 +1049,8 @@ PoC完了後、EventBridge等を利用した自動化を検討する。
 配信またはLive Chatの終了検知時は、そのままEndへ遷移せず、以下を実行する。
 
 1. 取得済みコメントの全分割バッチについて、SQS送信前の`collection_job_batches`への登録と、その登録済みPayloadのSQS送信成功を確認する。失敗時は正常終了扱いにしない
-2. Step Functionsで`collectionStoppedAt`を一度だけ確定し、Execution ARN、内部`streamId`、`videoId`、停止理由とともに保持する
-3. Data Collectorを最終メタデータ取得モードで呼び出し、`videos.list(part=snippet,liveStreamingDetails, id=videoId)`からタイトル、実開始日時、実終了日時を再取得する。このモードではコメントを再送信しない
+2. Step Functionsで`collectionStoppedAt`を一度だけ確定し、Execution ARN、内部`streamId`、`youtubeVideoId`、停止理由とともに保持する
+3. Data Collectorを最終メタデータ取得モードで呼び出し、`videos.list(part=snippet,liveStreamingDetails, id=youtubeVideoId)`からタイトル、実開始日時、実終了日時を再取得する。このモードではコメントを再送信しない
 4. Stream Metadata Lambdaへ必要項目を渡し、`streams`の最終メタデータと対象`collection_jobs`の終了状態を同一トランザクションで保存する。欠落のない収集と実終了日時の保存に成功した場合だけ`collectionStatus=COMPLETED`、`analysisStatus=FINALIZING`とし、それ以外は両方をFAILEDとする
 5. `collectionStatus=FAILED`の場合はFinalizerを呼び出さずFailへ遷移する
 6. `collectionStatus=COMPLETED`の場合だけAnalysis Finalizer Lambdaで送信済みバッチの分析完了を確認する。未処理の場合は10秒待機して再確認する
@@ -874,12 +1084,12 @@ DB保存は初回を含め最大4回、2秒・4秒・8秒のBackoffで再試行�
 DB保存のRetry上限到達時はFailとし、実行ID・エラー種別を記録して通知する。
 DB障害時に収集状態まで保存できたとは扱わない。
 
-運用者は失敗したExecution ARNと`videoId`を指定し、
+運用者は失敗したExecution ARNと`youtubeVideoId`を指定し、
 コメント収集を行わない終了処理専用の実行からメタデータ再取得・保存を再実行する。
 更新対象は元のCollection Jobとし、復旧実行のARNで別の収集ジョブを作らない。
 収集失敗履歴は保持し、欠けていた実終了日時だけを補完できるようにする。
 Finalizer失敗後に`analysisStatus=FINALIZING`が残った場合も、
-同じExecution ARNと`collectionJobId`を指定して失敗状態更新モードを再実行し、
+同じExecution ARNと`collectionJobId`を指定して`MARK_ANALYSIS_FAILED`を再実行し、
 `analysisStatus=FAILED`を保存する。収集は再開せず、分析結果も確定しない。
 手動停止・State Machine全体のタイムアウト等でCatchを実行できなかった場合も、この手順で補完する。
 

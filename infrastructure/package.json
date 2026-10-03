@@ -4,16 +4,19 @@
   "private": true,
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node --test dist/test/data-api.test.js dist/test/migration-definition.test.js dist/test/migration-runner.test.js dist/test/migration-handler.test.js"
+    "test": "npm run build && node --test dist/test/data-api.test.js dist/test/migration-definition.test.js dist/test/migration-runner.test.js dist/test/migration-handler.test.js dist/test/stream-metadata-validation.test.js dist/test/stream-metadata-operations.test.js dist/test/stream-metadata-database.test.js dist/test/stream-metadata-errors.test.js dist/test/stream-metadata-infrastructure.test.js"
   },
   "dependencies": {
     "@aws-sdk/client-rds-data": "^3.0.0",
+    "@aws-sdk/rds-signer": "^3.1141.0",
     "aws-cdk-lib": "^2.0.0",
-    "constructs": "^10.0.0"
+    "constructs": "^10.0.0",
+    "pg": "^8.23.0"
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.0",
     "@types/node": "^20.0.0",
+    "@types/pg": "^8.23.1",
     "aws-cdk": "^2.0.0",
     "esbuild": "^0.25.0",
     "ts-node": "^10.9.2",

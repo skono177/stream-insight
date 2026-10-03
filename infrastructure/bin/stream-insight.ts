@@ -29,5 +29,7 @@ const storageStack = new StorageStack(app, `stream-insight-${environment}-storag
 new BackendStack(app, `stream-insight-${environment}-backend`, {
   env: awsEnvironment,
   databaseCluster: storageStack.databaseCluster,
+  vpc: networkStack.vpc,
+  applicationSecurityGroup: networkStack.applicationSecurityGroup,
 });
 new FrontendStack(app, `stream-insight-${environment}-frontend`, { env: awsEnvironment });
