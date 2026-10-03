@@ -140,3 +140,26 @@ test('MigrationBundleHash frames file boundaries unambiguously', () => {
     });
   });
 });
+
+test('002 migration uses one ordered Data API statement per SQL file', () => {
+  const root = join(__dirname, '..', '..', 'lambda', 'migration', 'migrations');
+  const migration = discoverMigrations(root).find((item) => item.version === 2);
+  assert.ok(migration);
+  assert.equal(migration.name, 'stream_metadata_user');
+  assert.equal(migration.checksum.length, 64);
+  assert.deepEqual(migration.sqlFiles.map((file) => file.fileName), [
+    '001_create_role.sql',
+    '002_grant_rds_iam.sql',
+    '003_grant_database_connect.sql',
+    '004_grant_schema_usage.sql',
+    '005_grant_channels.sql',
+    '006_grant_streams.sql',
+    '007_grant_stream_metrics.sql',
+    '008_grant_collection_jobs.sql',
+    '009_grant_collection_job_batches.sql',
+    '010_grant_sequences.sql',
+  ]);
+  for (const file of migration.sqlFiles) {
+    assert.match(file.sql, /^[^;]+;\n?$/, file.relativePath);
+  }
+});

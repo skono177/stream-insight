@@ -173,6 +173,7 @@ test('STOP_COLLECTION transitions RUNNING to COMPLETED and verifies prerequisite
     collectionStoppedAt: '2026-08-23T16:00:10Z', collectionStatus: 'COMPLETED', lastPageToken: null,
     collectedCommentCount: '3', stopReason: 'STREAM_ENDED', errorCode: null });
   assert.deepEqual(output, { streamId: '1', collectionJobId: '2', collectionStatus: 'COMPLETED', analysisStatus: 'FINALIZING' });
+  assert.equal(db.calls[3].values?.[3], '2026-08-23T16:00:00Z');
 });
 
 test('STOP_COLLECTION transitions RUNNING to FAILED without requiring metrics', async () => {
@@ -182,6 +183,8 @@ test('STOP_COLLECTION transitions RUNNING to FAILED without requiring metrics', 
     collectionStoppedAt: '2026-08-23T16:00:10Z', collectionStatus: 'FAILED', lastPageToken: 'token',
     collectedCommentCount: '3', stopReason: 'ERROR', errorCode: 'FAIL' });
   assert.equal((output as { analysisStatus: string }).analysisStatus, 'FAILED');
+  assert.equal(db.calls[2].values?.[3], null);
+  assert.equal(db.calls[3].values?.[2], 'FAILED');
 });
 
 test('STOP_COLLECTION exact terminal retry does not update', async () => {
@@ -195,15 +198,44 @@ test('STOP_COLLECTION exact terminal retry does not update', async () => {
   assert.equal(db.calls.length, 2);
 });
 
-for (const endedAt of [null, '2026-08-23T17:00:00Z']) {
-  test(`STOP_COLLECTION rejects non-null ended_at change to ${endedAt ?? 'null'}`, async () => {
-    const db = new ScriptedDatabase([result([job()]), result([stream({ ended_at: '2026-08-23T16:00:00Z' })])]);
-    await assert.rejects(executeOperation(db, { operation: 'STOP_COLLECTION', streamId: '1', collectionJobId: '2', executionArn: 'arn',
-      youtubeVideoId: 'video', title: 'title', startedAt: '2026-08-23T15:00:00Z', endedAt,
-      collectionStoppedAt: '2026-08-23T16:00:10Z', collectionStatus: 'FAILED', lastPageToken: null,
-      collectedCommentCount: '3', stopReason: 'ERROR', errorCode: 'FAIL' }), StreamMetadataError);
-  });
-}
+test('STOP_COLLECTION FAILED preserves an existing ended_at when input endedAt is null and exact retry succeeds', async () => {
+  const existingEndedAt = '2026-08-23T16:00:00Z';
+  const input = { operation: 'STOP_COLLECTION' as const, streamId: '1', collectionJobId: '2', executionArn: 'arn',
+    youtubeVideoId: 'video', title: 'title', startedAt: '2026-08-23T15:00:00Z', endedAt: null,
+    collectionStoppedAt: '2026-08-23T16:00:10Z', collectionStatus: 'FAILED' as const, lastPageToken: null,
+    collectedCommentCount: '3', stopReason: 'ERROR', errorCode: 'FAIL' };
+  const db = new ScriptedDatabase([
+    result([job()]), result([stream({ ended_at: existingEndedAt })]), result([], 1), result([], 1),
+  ]);
+  const output = await executeOperation(db, input);
+  assert.equal((output as { analysisStatus: string }).analysisStatus, 'FAILED');
+  assert.match(db.calls[2].text, /UPDATE streams/);
+  assert.equal(db.calls[2].values?.[3], existingEndedAt);
+  assert.match(db.calls[3].text, /UPDATE collection_jobs/);
+  assert.equal(db.calls[3].values?.[2], 'FAILED');
+
+  const terminalJob = job({ collection_status: 'FAILED', analysis_status: 'FAILED',
+    collection_stopped_at: input.collectionStoppedAt, collected_comment_count: '3', stop_reason: 'ERROR', error_code: 'FAIL' });
+  const retry = new ScriptedDatabase([result([terminalJob]), result([stream({ ended_at: existingEndedAt })])]);
+  assert.equal((await executeOperation(retry, input) as { analysisStatus: string }).analysisStatus, 'FAILED');
+  assert.equal(retry.calls.length, 2);
+});
+
+test('STOP_COLLECTION rejects a different non-null ended_at but accepts the same PostgreSQL instant', async () => {
+  const existingEndedAt = '2026-08-23 16:00:00.000002+00';
+  const base = { operation: 'STOP_COLLECTION' as const, streamId: '1', collectionJobId: '2', executionArn: 'arn',
+    youtubeVideoId: 'video', title: 'title', startedAt: '2026-08-23T15:00:00Z',
+    collectionStoppedAt: '2026-08-23T16:00:10Z', collectionStatus: 'FAILED' as const, lastPageToken: null,
+    collectedCommentCount: '3', stopReason: 'ERROR', errorCode: 'FAIL' };
+  const mismatch = new ScriptedDatabase([result([job()]), result([stream({ ended_at: existingEndedAt })])]);
+  await assert.rejects(executeOperation(mismatch, { ...base, endedAt: '2026-08-23T17:00:00Z' }), StreamMetadataError);
+
+  const same = new ScriptedDatabase([
+    result([job()]), result([stream({ ended_at: existingEndedAt })]), result([], 1), result([], 1),
+  ]);
+  assert.equal((await executeOperation(same, { ...base, endedAt: '2026-08-23T16:00:00.0000025Z' }) as
+    { analysisStatus: string }).analysisStatus, 'FAILED');
+});
 
 test('STOP_COLLECTION terminal retry compares youtubeVideoId and only permits FAILED ended_at recovery', async () => {
   const terminalJob = job({ collection_status: 'FAILED', analysis_status: 'FAILED', collection_stopped_at: '2026-08-23T16:00:10Z',

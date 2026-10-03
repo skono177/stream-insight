@@ -5,6 +5,7 @@ import test from 'node:test';
 import { BackendStack } from '../lib/backend-stack';
 import { NetworkStack } from '../lib/network-stack';
 import { StorageStack } from '../lib/storage-stack';
+import { discoverMigrations } from '../lambda/migration/migration-definition';
 
 let cachedTemplates: { backend: Template; storage: Template; network: Template } | undefined;
 function templates(): { backend: Template; storage: Template; network: Template } {
@@ -59,7 +60,17 @@ test('IAM grants only connect, logs and ENI actions with no Secrets Manager perm
   assert.match(connectResource, /\/stream_metadata_user/);
   assert.doesNotMatch(connectResource, /\*/);
   const actions = statements.flatMap((statement) => typeof statement.Action === 'string' ? [statement.Action] : statement.Action);
-  assert.ok(actions.includes('ec2:CreateNetworkInterface'));
+  assert.deepEqual(actions.filter((action) => action.startsWith('ec2:')).sort(), [
+    'ec2:AssignPrivateIpAddresses',
+    'ec2:CreateNetworkInterface',
+    'ec2:DeleteNetworkInterface',
+    'ec2:DescribeNetworkInterfaces',
+    'ec2:DescribeSubnets',
+    'ec2:UnassignPrivateIpAddresses',
+  ]);
+  const eniStatement = statements.find((statement) => Array.isArray(statement.Action) &&
+    statement.Action.includes('ec2:CreateNetworkInterface'));
+  assert.equal(eniStatement?.Resource, '*');
   assert.equal(actions.some((action) => action === 'secretsmanager:GetSecretValue'), false);
   assert.equal(actions.some((action) => action.startsWith('rds-data:')), false);
   assert.equal(actions.some((action) => action.startsWith('rds:')), false);
@@ -80,10 +91,22 @@ test('Aurora ingress is restricted to the application security group and migrati
   network.resourceCountIs('AWS::EC2::NatGateway', 0);
   network.resourceCountIs('AWS::EC2::VPCEndpoint', 1);
   storage.resourceCountIs('AWS::RDS::DBProxy', 0);
-  const sql = require('node:fs').readFileSync(
-    require('node:path').join(__dirname, '..', '..', 'lambda', 'migration', 'migrations', '002_stream_metadata_user', '001_stream_metadata_user.sql'),
-    'utf8',
-  ) as string;
-  assert.match(sql, /GRANT rds_iam TO stream_metadata_user/);
+  const migrationRoot = require('node:path').join(__dirname, '..', '..', 'lambda', 'migration', 'migrations');
+  const migration = discoverMigrations(migrationRoot).find((item) => item.version === 2);
+  assert.ok(migration);
+  const statements = migration.sqlFiles.map((file) => file.sql.trim());
+  assert.deepEqual(statements, [
+    'CREATE ROLE stream_metadata_user LOGIN;',
+    'GRANT rds_iam TO stream_metadata_user;',
+    'GRANT CONNECT ON DATABASE stream_insight TO stream_metadata_user;',
+    'GRANT USAGE ON SCHEMA public TO stream_metadata_user;',
+    'GRANT SELECT, INSERT, UPDATE ON TABLE channels TO stream_metadata_user;',
+    'GRANT SELECT, INSERT, UPDATE ON TABLE streams TO stream_metadata_user;',
+    'GRANT SELECT, INSERT ON TABLE stream_metrics TO stream_metadata_user;',
+    'GRANT SELECT, INSERT, UPDATE ON TABLE collection_jobs TO stream_metadata_user;',
+    'GRANT SELECT, INSERT ON TABLE collection_job_batches TO stream_metadata_user;',
+    'GRANT USAGE ON SEQUENCE channels_id_seq, streams_id_seq, collection_jobs_id_seq TO stream_metadata_user;',
+  ]);
+  const sql = statements.join('\n');
   assert.doesNotMatch(sql, /DELETE|CREATE ON SCHEMA|TRUNCATE|ALL PRIVILEGES/);
 });

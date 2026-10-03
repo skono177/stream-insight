@@ -194,10 +194,16 @@ async function registerBatches(db: SqlExecutor, input: RegisterBatchesInput): Pr
 
 function terminalMatches(stream: StreamRow, job: JobRow, input: StopCollectionInput): boolean {
   return stream.youtube_video_id === input.youtubeVideoId && stream.title === input.title &&
-    sameTime(stream.started_at, input.startedAt) && sameTime(stream.ended_at, input.endedAt) &&
+    sameTime(stream.started_at, input.startedAt) && stopEndedAtMatches(stream, input) &&
     sameTime(job.collection_stopped_at, input.collectionStoppedAt) && job.collection_status === input.collectionStatus &&
     job.last_page_token === input.lastPageToken && idString(job.collected_comment_count) === input.collectedCommentCount &&
     job.stop_reason === input.stopReason && job.error_code === input.errorCode;
+}
+
+function stopEndedAtMatches(stream: StreamRow, input: StopCollectionInput): boolean {
+  return input.collectionStatus === 'FAILED' && input.endedAt === null
+    ? true
+    : sameTime(stream.ended_at, input.endedAt);
 }
 
 async function stopCollection(db: SqlExecutor, input: StopCollectionInput): Promise<StopCollectionOutput> {
@@ -227,7 +233,8 @@ async function stopCollection(db: SqlExecutor, input: StopCollectionInput): Prom
       collectionStatus: 'FAILED', analysisStatus: job.analysis_status === 'FAILED' ? 'FAILED' : 'FINALIZING' };
   }
 
-  if (stream.ended_at !== null && !sameTime(stream.ended_at, input.endedAt)) {
+  const preserveEndedAt = input.collectionStatus === 'FAILED' && input.endedAt === null;
+  if (stream.ended_at !== null && !preserveEndedAt && !sameTime(stream.ended_at, input.endedAt)) {
     throw stateConflict('A non-null stream end time cannot be removed or changed');
   }
   if (input.collectionStatus === 'COMPLETED') {
@@ -238,7 +245,7 @@ async function stopCollection(db: SqlExecutor, input: StopCollectionInput): Prom
   await db.query(
     `UPDATE streams SET title = $2, started_at = $3::timestamptz, ended_at = $4::timestamptz,
        updated_at = CURRENT_TIMESTAMP WHERE id = $1::bigint`,
-    [input.streamId, input.title, input.startedAt, input.endedAt],
+    [input.streamId, input.title, input.startedAt, preserveEndedAt ? stream.ended_at : input.endedAt],
   );
   const analysisStatus = input.collectionStatus === 'COMPLETED' ? 'FINALIZING' : 'FAILED';
   await db.query(
