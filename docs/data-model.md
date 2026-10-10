@@ -50,6 +50,10 @@ PoCでは以下のデータを保存対象とする。
 - コメント投稿日時
 - コメント集計・分析に必要な最小限の属性
 
+YouTube Live Chatのmessage typeは`textMessageEvent`だけを対象とする。
+Super Chat、Super Sticker、membership、gift、poll、moderation等のeventは、
+表示文字列を持つ場合でも通常コメントへ変換せず対象外とする。
+
 保存対象は、以下のPoC分析指標の算出に必要なデータに限定する。
 
 - 総コメント数
@@ -106,6 +110,8 @@ s3://<bucket>/
 │   └── youtube/
 │       └── collection-jobs/
 │           └── <collection-job-id>/
+│               ├── pages/
+│               │   └── <page-id>.json
 │               └── batches/
 │                   └── <batch-id>.json
 └── raw/
@@ -118,7 +124,10 @@ s3://<bucket>/
                     └── ...
 ```
 
-`outbox/`には、SQS送信前に7章のメッセージと同一のJSON Payloadを一時保存する。
+`outbox/.../pages/`には、YouTube APIの1回の正常応答から抽出・正規化したコメントを
+`comment-page-v1`のPage SnapshotとしてBatch生成前に保存する。
+
+`outbox/.../batches/`には、SQS送信前に7章のメッセージと同一のJSON Payloadを一時保存する。
 Data CollectorはOutboxオブジェクトの保存後に送信予定をAuroraへ登録し、
 登録が完了したオブジェクトだけをSQSへ送信する。
 
@@ -623,21 +632,22 @@ Payload SHA-256はこのバイト列から算出し、`collection_job_batches`�
 
 ```json
 {
+  "schemaVersion": "comment-batch-v1",
   "batchId": "batch-v1-4e6b8ac84f87fe828dfc6fa7c2bd2cbc4efd017322d650913bcae10bec864ad6",
   "streamId": "1",
   "collectionJobId": "1",
-  "analysisStartAt": "2026-08-23T15:00:20Z",
+  "analysisStartAt": "2026-08-23T15:00:20.000000Z",
   "youtubeVideoId": "youtube-video-id",
   "comments": [
     {
       "commentId": "comment-001",
       "text": "こんにちは",
-      "publishedAt": "2026-08-23T15:00:00Z"
+      "publishedAt": "2026-08-23T15:00:00.000000Z"
     },
     {
       "commentId": "comment-002",
       "text": "今日も楽しみ",
-      "publishedAt": "2026-08-23T15:00:05Z"
+      "publishedAt": "2026-08-23T15:00:05.000000Z"
     }
   ]
 }
@@ -645,6 +655,20 @@ Payload SHA-256はこのバイト列から算出し、`collection_job_batches`�
 
 PoCではSQSメッセージについても、
 分析に必要な項目のみを含める。
+
+`schemaVersion`は`comment-batch-v1`に固定する。Payload property順は次に固定する。
+
+```text
+schemaVersion
+batchId
+streamId
+collectionJobId
+analysisStartAt
+youtubeVideoId
+comments
+```
+
+コメントproperty順は`commentId`、`text`、`publishedAt`とする。
 
 メンバーシップ情報、Super Chat情報、投稿者情報等の
 PoCで利用しないデータはSQSメッセージへ含めない。
@@ -668,20 +692,18 @@ SQSの送信成功を全登録済みバッチで確認してから次ページ�
 
 Data Collectorは以下の手順で各送信バッチを生成する。
 
-1. PoCで保存を許可した項目だけを抽出する
-2. 同一取得結果内の`commentId`重複を除き、IDのUTF-8バイト列の昇順で並べる。同じIDで本文・投稿日時が異なる場合は任意に選択せずエラーとする
-3. SQSメッセージのUTF-8サイズ上限内に収まるよう、固定の分割規則で先頭から分割する。上限値・規則はバージョン管理し、再試行中は変更しない
-4. 各分割バッチについて、以下の固定順序の配列をJSON化し、そのUTF-8バイト列のSHA-256を算出する
+1. 保存済みの`comment-page-v1` Snapshotから`textMessageEvent`だけを読み出す
+2. PoCで保存を許可した`commentId`、`text`、`publishedAt`だけを抽出する
+3. 同一取得結果内の`commentId`重複を除き、IDのUTF-8バイト列の昇順で並べる。同じIDで本文・投稿日時が異なる場合は任意に選択せず`COMMENT_ID_CONFLICT`とする
+4. SQSメッセージのUTF-8サイズ上限内に収まるよう、7.4節の固定分割規則で先頭から分割する。上限値・規則はバージョン管理し、再試行中は変更しない
+5. 各分割バッチについて、以下の固定順序の配列をJSON化し、そのUTF-8バイト列のSHA-256を算出する
 
 ```text
 ["batch-v1", streamId, youtubeVideoId,
   [[commentId, text, publishedAt], ...]]
 ```
 
-JSON化はPythonの`json.dumps(value, ensure_ascii=False, separators=(",", ":"))`とし、
-BOM・末尾改行を付けない。`publishedAt`はUTC・小数秒6桁・末尾`Z`の形式へ統一する。
-コメントIDと本文にはUnicode正規化や小文字化を行わない。
-頻出ワード用の正規化はAnalyzerで別途行う。
+JSON化は7.2節の`canonical-json-v1`に従う。
 
 同じ送信内容であれば、取得順序、Lambda実行、SQS Message IDが変わっても同じ`batchId`となる。
 ページトークンがない初回取得も同じ規則を適用する。
@@ -691,6 +713,123 @@ BOM・末尾改行を付けない。`publishedAt`はUTC・小数秒6桁・末尾
 同じ取得位置からの再取得で内容が変わっても、同一内容であるとは仮定しない。
 コメントが追加・削除された場合や分割境界が変わった場合は別バッチとして扱い、
 重なるコメントは9.5節のコメントID単位の処理済み管理で二重集計を防止する。
+
+### 7.2. canonical-json-v1
+
+`canonical-json-v1`は本システムのHash入力に限定したJSON byte生成規則であり、
+任意のJSON objectを正規化する一般仕様としては扱わない。
+
+- Hash入力は固定順序の配列、JSON stringおよびそれらの入れ子だけで構成する
+- ID、件数およびtimestampをJSON numberにせずstringとする
+- Pythonでは`json.dumps(value, ensure_ascii=False, separators=(",", ":"))`を使用する
+- TypeScriptでは事前検証済みの同じ配列に`JSON.stringify(value)`を使用する
+- 出力はUTF-8、BOMなし、末尾改行なし、JSON外の空白なしとする
+- `"`、`\\`、U+0008、U+0009、U+000A、U+000C、U+000DはJSON規則どおりescapeする
+- その他のU+0000からU+001Fは小文字hexの`\\u00xx`とする
+- 日本語、絵文字、結合文字、U+2028およびU+2029はUnicode escapeへ変換せずUTF-8で直接出力する
+- Unicode正規化、小文字化、trim、改行除去およびURL除去を行わない
+- unpaired surrogateはUTF-8変換前に検出して入力不正として拒否する
+- NaN、Infinity、`undefined`およびJSON numberをHash入力へ含めない
+
+PythonとTypeScriptの一致は、日本語、絵文字、結合文字、全JSON制御文字、U+2028、U+2029、
+quote、backslashおよびslashを含むgolden vectorのUTF-8 hexとSHA-256で検証する。
+
+`publishedAt`および`analysisStartAt`はUTC・小数秒6桁・末尾`Z`へ統一する。
+小数秒が6桁未満の場合は右側を0で埋め、7桁以上の場合はties-to-evenでマイクロ秒へ丸める。
+丸めによる秒、日、月および年の繰り上がりを許容し、JavaScript `Date`だけに依存して
+マイクロ秒を処理しない。
+
+コメントの決定的ソートは`commentId`をUTF-8へ変換し、そのバイト列を符号なし辞書順で比較する。
+TypeScriptではlocaleやUTF-16 code unit順ではなく`Buffer.compare`相当を使用する。
+
+### 7.3. Page Snapshot
+
+Page Snapshot schemaは`comment-page-v1`とする。
+
+```json
+{
+  "schemaVersion": "comment-page-v1",
+  "streamId": "1",
+  "collectionJobId": "1",
+  "youtubeLiveChatId": "youtube-live-chat-id",
+  "requestPageToken": null,
+  "responseNextPageToken": "next-page-token",
+  "observationStartedAt": "2026-08-23T15:00:20.123456Z",
+  "pollingIntervalMillis": 5000,
+  "comments": [
+    {
+      "commentId": "comment-001",
+      "text": "こんにちは",
+      "publishedAt": "2026-08-23T15:00:21.000000Z"
+    }
+  ]
+}
+```
+
+`requestPageToken`は初回だけNULL、その他のfieldは必須とする。
+`responseNextPageToken`は継続取得可能な正常応答で非NULLの文字列とする。
+`pollingIntervalMillis`は0以上のsafe integerとする。
+
+`pageId`は`page-v1-`と、以下を`canonical-json-v1`でJSON化したUTF-8 bytesの
+SHA-256小文字hexを連結する。
+
+```text
+["page-v1", streamId, collectionJobId, youtubeLiveChatId,
+ requestPageTokenOrEmptyString]
+```
+
+Object keyは次の形式とする。
+
+```text
+outbox/youtube/collection-jobs/<collectionJobId>/pages/<pageId>.json
+```
+
+Snapshotは`If-None-Match: *`で保存する。同じrequest identityで412となった場合は、
+既存objectをGETしてUTF-8、JSON schema、内部ID、Live Chat IDおよびrequest tokenを検証し、
+最初に保存されたSnapshotを正として再利用する。新しいYouTube応答が異なっても既存Snapshotを上書きしない。
+
+YouTube API応答後からSnapshotの最初の耐久保存前までの障害では再取得結果が変化し得る。
+外部APIとS3を同一トランザクションにできないため、この区間の完全なデータ保全は保証しない。
+
+### 7.4. Batch分割とMessageBody上限
+
+最終SQS MessageBodyの最大値は921,600 bytes（900 KiB）とする。
+単純な文字数やコメント部分だけではなく、`comment-batch-v1`の全property、JSON escape、
+`batchId`および構文文字を含む最終UTF-8 bytesを`Buffer.byteLength(body, "utf8")`相当で測定する。
+
+決定的greedy分割は次の手順とする。
+
+1. 正規化、重複排除およびUTF-8 byte順ソートを完了する
+2. 先頭から1コメントを追加した候補集合を作る
+3. 候補集合から7.1節の`batchId`を生成する
+4. 固定property順で完全な`comment-batch-v1` MessageBodyを生成する
+5. 921,600 bytes以下なら候補を採用し、次のコメントを試す
+6. 超過した場合は直前の候補を1 Batchとして確定し、未採用コメントから次Batchを開始する
+7. 1コメントだけでも超過する場合は本文を切り捨てず`MESSAGE_TOO_LARGE`とする
+
+空Batchは生成しない。同じPage Snapshot、同じ`batch-v1`、同じ上限値および同じtimestamp規則からは、
+Lambda実行や取得順序に依存せず同じ分割境界とBatch IDを生成する。
+
+SQS `SendMessageBatch`を将来利用する場合は、最大10件の制約に加え、
+各MessageBodyと1 request内のMessageBody合計がともに1,048,576 bytes以下であることを検証する。
+900 KiB級Payloadは原則として`SendMessage`で1件ずつ送信する。
+
+### 7.5. Payload SHA-256とBatch Outbox
+
+`payloadSha256`は、`schemaVersion`、`batchId`、`streamId`、`collectionJobId`、
+`analysisStartAt`、`youtubeVideoId`および`comments`を含む最終MessageBodyのUTF-8 bytesに対する
+SHA-256小文字hex 64桁とする。`batchId`のHash対象とは異なる。
+
+Batch Outbox keyは次の形式とする。
+
+```text
+outbox/youtube/collection-jobs/<collectionJobId>/batches/<batchId>.json
+```
+
+`PutObject`は`If-None-Match: *`を使用する。412の場合は既存objectをGETし、実バイト列から
+SHA-256を再計算して一致するときだけ再利用する。不一致は`OUTBOX_CONFLICT`とし上書きしない。
+409は同じbytesで限定回数Retryし、その後に決定的keyをGETして照合する。
+ETag、S3 metadataまたはContent-Lengthを`payloadSha256`の代用にしない。
 
 ---
 
@@ -1498,7 +1637,7 @@ YouTube APIから取得した未承認データについては、
 YouTube API Services Developer Policiesの保存期間に関する要件を考慮し、
 Stream Insightでは7暦日を超えて保存しない。
 
-S3 OutboxのPayloadもコメント本文を含むためRaw Dataと同じ保持対象とし、
+S3 OutboxのPage SnapshotとBatch Payloadもコメント本文を含むためRaw Dataと同じ保持対象とし、
 `outbox/`プレフィックスへ7暦日で削除するLifecycle Ruleを適用する。
 
 S3 Lifecycleを利用し、
