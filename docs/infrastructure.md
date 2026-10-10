@@ -604,13 +604,12 @@ Start
 Get Stream Metadata
 (Data Collector Lambda)
   ↓
-START_COLLECTION
-(Stream Metadata Lambda)
-  ↓
-internal streamId
-  ↓
-Collect Comments
-(Data Collector Lambda)
+streamStatus?
+  ├── UPCOMING → Wait 30秒 → Get Stream Metadata（最大30分）
+  ├── ENDED → Collection Jobを作成せず正常終了
+  ├── LIVEかつLive Chat利用不可 → Fail
+  └── LIVEかつ必須fieldあり → START_COLLECTION → internal streamId → Collect Comments
+                                                        (Data Collector Lambda)
   ↓
 Save Outbox Payload
 (S3)
@@ -621,30 +620,28 @@ REGISTER_BATCHES
 Send Registered Payload
 (Data Collector Lambda → SQS)
   ↓
-Live Chat終了？
-  ├── Yes
-  │     ↓
-  │    Get Final Stream Metadata (Data Collector Lambda)
-  │     ↓
-  │    STOP_COLLECTION (Stream Metadata Lambda)
-  │     ↓
-  │    collectionStatus?
-  │      ├── FAILED → analysisStatus=FAILED → Fail
-  │      └── COMPLETED
-  │           ↓
-  │          Finalize Analysis (Analysis Finalizer Lambda)
-  │           ↓
-  │          未処理バッチあり？
-  │            ├── Yes → Wait 10秒 → Finalize Analysis
-  │            └── No  → analysisStatus=COMPLETED → End
-  │
-  └── No
+Checkpoint確定
+  ↓
+offlineAtあり？
+  ├── No → Wait → Collect Comments → ...
+  └── Yes ──────────────────────────────┐
+                                       │
+COLLECT_COMMENTSのLIVE_CHAT_ENDED Catch │
+（pendingPageがない場合だけ）───────────┘
+  ↓
+Get Final Stream Metadata (Data Collector Lambda)
+  ↓
+STOP_COLLECTION (Stream Metadata Lambda)
+  ↓
+collectionStatus?
+  ├── FAILED → analysisStatus=FAILED → Fail
+  └── COMPLETED
         ↓
-       Wait
+       Finalize Analysis (Analysis Finalizer Lambda)
         ↓
-Collect Comments
-        ↓
-       ...
+       未処理バッチあり？
+         ├── Yes → Wait 10秒 → Finalize Analysis
+         └── No  → analysisStatus=COMPLETED → End
 ```
 
 Data Collector LambdaおよびStream Metadata Lambdaから返却された
@@ -655,6 +652,7 @@ streamId
 collectionJobId
 youtubeVideoId
 youtubeLiveChatId
+streamStartWaitStartedAt（開始待ち中のみ）
 checkpoint
 pendingPage
 collectionStatus
@@ -670,6 +668,16 @@ Stream Metadata Lambdaが`collection_jobs.observationStartedAt`と
 `stream_metrics.analysisStartAt`を保存する。
 `analysisStartAt`は`streams.startedAt`と`observationStartedAt`の遅い方とする。
 取得コメントが0件の場合もこの保存処理を実行する。
+
+`GET_STREAM_METADATA`が`UPCOMING`を返した場合は30秒間隔で再取得し、最初の取得から30分で
+`STREAM_START_TIMEOUT`とする。`ENDED`はCollection Jobを作成せず正常終了する。
+`LIVE`でも`startedAt`または`youtubeLiveChatId`がない場合は`LIVE_CHAT_UNAVAILABLE`で失敗する。
+開始待ちの基準はStep Functionsが最初の取得前に一度だけ確定する`streamStartWaitStartedAt`とし、
+YouTube APIの一時エラーRetryを含めて30分を超えた場合に終了する。Retryで基準時刻を更新しない。
+
+コメント取得の成功応答に`offlineAt`が含まれる場合も、Snapshot、Batch登録、SQS送信、
+checkpoint確定を完了してから最終メタデータ取得へ進む。`liveChatEnded`エラーによる終了遷移は
+未処理の`pendingPage`がない場合だけ許可する。
 
 ---
 
@@ -1772,13 +1780,17 @@ VPC Lambdaに必要な`ec2:CreateNetworkInterface`、`ec2:DescribeNetworkInterfa
 以下は後続のAnalyzer Lambda実装Issueで設定する。
 
 ```text
-SQS ReceiveMessage
-SQS DeleteMessage
+sqs:ReceiveMessage
+sqs:DeleteMessage
+sqs:GetQueueAttributes
+Resource: <Comment Queue ARN>
 S3 PutObject
 rds-db:connect
 Resource: arn:aws:rds-db:<region>:<account-id>:dbuser:<cluster-resource-id>/analyzer_user
 CloudWatch Logs
 ```
+
+Comment QueueはSSE-SQSを使用するため、Analyzer LambdaにはSQS暗号化用の`kms:Decrypt`を付与しない。
 
 ### Analysis Finalizer Lambda
 
@@ -2086,9 +2098,17 @@ Database endpoint、port、DB Cluster Resource ID、IAM connect grantおよびSe
 公開済みDatabaseClusterから取得する。Aurora Security GroupやResource IDを新たな
 `public readonly` propertyとして公開しない。
 
+Data Collector Lambda用には、`BackendStackProps`へ`rawDataBucket: s3.IBucket`を追加し、
+StorageStackが`public readonly rawDataBucket`として公開するBucketを`stream-insight.ts`から渡す。
+Data Collectorの`RAW_DATA_BUCKET_NAME`には`rawDataBucket.bucketName`を設定する。
+実行Roleには対象Bucketの`outbox/*`に対する`s3:PutObject`と`s3:GetObject`だけを付与し、
+`raw/*`や他Bucketへの権限は付与しない。これによりBucket参照による
+BackendStack → StorageStackの既存依存関係へ統合し、名前による再検索や手動ARN構築を行わない。
+
 BackendStack内では`DatabaseMigration` Custom Resourceを参照可能なconstructとして保持し、
 Stream Metadata Lambdaから明示依存を設定する。Stack間依存はVPCとApplication Security Groupの参照による
-BackendStack → NetworkStack、およびDatabaseCluster参照によるBackendStack → StorageStackとする。
+BackendStack → NetworkStack、およびDatabaseClusterとRaw Data Bucket参照による
+BackendStack → StorageStackとする。
 
 CloudWatch Log Groupsには以下を設定する。
 

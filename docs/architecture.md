@@ -166,6 +166,7 @@ streamId
 collectionJobId
 youtubeVideoId
 youtubeLiveChatId
+streamStartWaitStartedAt（開始待ち中のみ）
 checkpoint
 pendingPage
 collectionStatus
@@ -183,13 +184,20 @@ Start
 Get Stream Metadata
 (Data Collector Lambda)
   ↓
-START_COLLECTION
-(Stream Metadata Lambda)
-  ↓
-internal streamId取得
-  ↓
-Collect Comments
-(Data Collector Lambda)
+streamStatus?
+  ├─ UPCOMING → Wait 30秒 → Get Stream Metadata
+  │             （最大30分、超過時は開始待ちTimeoutでFail）
+  ├─ ENDED    → 収集対象外として正常終了
+  ├─ LIVEかつLive Chat利用不可 → LIVE_CHAT_UNAVAILABLEでFail
+  └─ LIVEかつstartedAt / youtubeLiveChatIdあり
+  │             ↓
+  │           START_COLLECTION
+  │           (Stream Metadata Lambda)
+  │             ↓
+  │           internal streamId取得
+  │             ↓
+  │           Collect Comments
+  │           (Data Collector Lambda)
   ↓
 S3 OutboxへPayload保存
   ↓
@@ -348,6 +356,7 @@ optional fieldは原則として使用せず、値が存在し得ないfieldは�
 | `YOUTUBE_TRANSIENT` | timeout、429、5xx、一時的通信障害 | Backoff付きRetry |
 | `LIVE_CHAT_UNAVAILABLE` | Live Chat無効・未取得・not found | 状態により待機または失敗 |
 | `LIVE_CHAT_ENDED` | Live Chat終了 | Retryせず終了処理へ進む |
+| `STREAM_START_TIMEOUT` | UPCOMINGの開始待ちが30分を超過 | Retryせず失敗 |
 | `S3_TRANSIENT` | S3 timeout、5xx、継続する409 | Retry可 |
 | `OUTBOX_CONFLICT` | 同一keyの内容またはrequest identity不整合 | 不可 |
 | `OUTBOX_INTEGRITY` | 保存済みbytesのSHA-256不一致 | 不可 |
@@ -396,6 +405,16 @@ Output：
 `START_COLLECTION`は`streamStatus=LIVE`で`startedAt`と`youtubeLiveChatId`が非NULLの場合だけ呼び出す。
 同じVideo IDへのRetryは安全だが、YouTube側の状態変化によりOutputが変わり得る。
 
+Step Functionsは`streamStatus`により次のように分岐する。
+
+- `UPCOMING`：Collection Jobを作成せず30秒Wait後に同じVideo IDを再取得する。Step Functionsが最初の取得前に`streamStartWaitStartedAt`を一度だけ確定して保持し、その時点から30分を上限とする。超過時は`STREAM_START_TIMEOUT`で失敗する
+- `LIVE`：`startedAt`と`youtubeLiveChatId`が非NULLの場合だけ`START_COLLECTION`へ進む
+- `LIVE`で`startedAt`または`youtubeLiveChatId`がNULL：`LIVE_CHAT_UNAVAILABLE`として収集を開始せず失敗する
+- `ENDED`：新規Collection Jobを作成せず、収集対象外として正常終了する
+
+開始待ちの30秒間隔・最大30分はPoC初期値とし、Lambda内では待機しない。
+YouTube APIの一時エラーRetry時間も同じ30分の経過時間へ含め、Retryで開始時刻を更新しない。
+
 #### 4.3.3. `COLLECT_COMMENTS`
 
 Input：
@@ -428,6 +447,7 @@ Output：
     "snapshotSha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
     "observationStartedAt": "2026-08-23T15:00:20.123456Z",
     "pollingIntervalMillis": 5000,
+    "offlineAt": null,
     "collectedCommentCount": "120",
     "batches": [
       {
@@ -442,6 +462,8 @@ Output：
 
 `checkpoint.nextPageToken`、`checkpoint.observationStartedAt`および
 `checkpoint.pollingIntervalMillis`はnullable、その他のfieldは必須とする。
+`pendingPage.offlineAt`もnullableとし、YouTube成功応答に`offlineAt`が存在する場合は
+UTC・小数秒6桁・末尾`Z`へ正規化して設定する。
 `pollingIntervalMillis`は0以上のsafe integerとし、Step FunctionsのWaitでは秒へ切り上げる。
 初回要求ではYouTube API要求直前のUTC時刻を候補として保持し、正常応答時だけ
 `pendingPage.observationStartedAt`へ設定する。2回目以降はcheckpointの同じ値を引き継ぐ。
@@ -476,6 +498,7 @@ Input：
     "snapshotSha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
     "observationStartedAt": "2026-08-23T15:00:20.123456Z",
     "pollingIntervalMillis": 5000,
+    "offlineAt": null,
     "collectedCommentCount": "120",
     "batches": []
   }
@@ -487,6 +510,7 @@ Output：
 ```json
 {
   "sentBatchCount": 0,
+  "offlineAt": null,
   "checkpoint": {
     "nextPageToken": "next-page-token",
     "observationStartedAt": "2026-08-23T15:00:20.123456Z",
@@ -496,9 +520,10 @@ Output：
 }
 ```
 
-すべてのfieldを必須とし、`requestPageToken`だけをnullableとする。
+すべてのfieldを必須とし、`requestPageToken`と`offlineAt`だけをnullableとする。
 `registeredBatchCount`は0以上のsafe integerで、`pendingPage.batches.length`との一致を必須とする。
 空配列かつ登録数0はSQSを呼ばず成功とする。
+Outputの`offlineAt`は入力`pendingPage.offlineAt`を変更せず返す。
 
 送信前にSnapshotと各OutboxをGETし、実バイト列のSHA-256、key内の内部IDとBatch ID、
 Payload内の`streamId`、`collectionJobId`および`batchId`を検証する。
@@ -555,8 +580,14 @@ SHA-256小文字hex 64桁を連結する。
 ```
 
 Snapshot schemaは`comment-page-v1`とし、`schemaVersion`、要求時と応答時のPage Token、
-`observationStartedAt`、`pollingIntervalMillis`および正規化済みコメントを含める。
+`observationStartedAt`、`pollingIntervalMillis`、nullableな`offlineAt`および正規化済みコメントを含める。
 コメントには`commentId`、`text`および`publishedAt`だけを含める。
+
+`snapshotSha256`は、S3へ保存されたSnapshot Objectの実UTF-8 bytesを対象とする
+SHA-256のlowercase hexadecimal 64文字とする。既存Objectを再利用する場合は、S3 GETで取得した
+実バイト列から再計算する。JSONをparse後に再serializeしたbytesでHashを検証してはならない。
+不一致は`OUTBOX_INTEGRITY`として失敗する。`pageId`はrequest identityのHash、
+`snapshotSha256`は保存Object bytesのHashであり、目的とHash対象が異なる。
 
 `PutObject`は`If-None-Match: *`を使用する。同じrequest identityのSnapshotが既に存在する場合は、
 既存objectの実バイト列、schema、内部ID、Live Chat IDおよび`requestPageToken`を検証して再利用し、
@@ -593,6 +624,15 @@ COLLECT_COMMENTS
 `responseNextPageToken`、累積件数およびポーリング間隔をcheckpointへ反映しない。
 送信失敗・結果不明時は`pendingPage`を維持し、送信Operationだけを再試行する。
 
+YouTube成功応答に`offlineAt`がある場合も、コメントを含むSnapshotと全Batch Outboxを保存し、
+`REGISTER_BATCHES`と全BatchのSQS送信を完了してcheckpointを確定する。その後、
+`SEND_REGISTERED_BATCHES`が返した非NULLの`offlineAt`をChoiceで判定し、Waitや次ページ取得を挟まず
+`GET_FINAL_STREAM_METADATA`へ進む。`offlineAt`を`streams.endedAt`の代用には使用しない。
+
+`liveChatEnded`エラーは`pendingPage=null`の状態で開始した`COLLECT_COMMENTS`から返された場合だけ
+終了処理へ進める。`pendingPage`が存在する間は同Operationを呼ばず、登録・送信・checkpoint確定を
+完了するまで終了分岐を評価しない。
+
 #### 4.3.8. Step FunctionsとIAMの境界
 
 Data CollectorはDBの登録状態を直接確認しない。Step Functionsは`REGISTER_BATCHES`成功時に返された
@@ -620,6 +660,8 @@ Data Collector実行RoleにはAurora、
 | 登録成功後、送信前 | `SEND_REGISTERED_BATCHES`だけを実行する |
 | SQS部分成功・結果不明 | 全Descriptorを同じOutboxから再送する |
 | SQS成功後、checkpoint確定前 | pendingPageを維持して再送後、同じcheckpointを確定する |
+| `offlineAt`を含む成功応答 | Snapshot、登録、送信、checkpoint確定後に最終メタデータ取得へ進む |
+| `liveChatEnded`エラー | pendingPageがない場合だけ最終メタデータ取得へ進む |
 | Outbox欠落・7日Lifecycle期限切れ | YouTubeから再生成せず`OUTBOX_EXPIRED`で収集を失敗させる |
 
 YouTube API応答と最初のS3保存は同一トランザクションにできず、投稿者またはmoderatorによる
@@ -646,7 +688,7 @@ API Keyを利用可能と読める一方、Live Streaming APIのCredential説明
 3. API Keyだけで`videos.list`を実行し、`activeLiveChatId`を確認する
 4. 同じAPI Keyで`liveChatMessages.list(part=id,snippet)`を実行する
 5. `pollingIntervalMillis`経過後、返却された`nextPageToken`で2回目を実行する
-6. 200応答と必要fieldを確認できればAPI Key方式を採用する
+6. 200応答と必要fieldに加え、配信終了時に`offlineAt`または`liveChatEnded`を確認できればAPI Key方式を採用する
 7. 認証・認可エラーになる場合は最小のread-only scopeによるOAuth方式を再検討する
 
 検証完了までOAuth Client、Refresh Token管理およびToken更新処理を実装しない。

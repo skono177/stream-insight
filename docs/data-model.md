@@ -633,7 +633,7 @@ Payload SHA-256はこのバイト列から算出し、`collection_job_batches`�
 ```json
 {
   "schemaVersion": "comment-batch-v1",
-  "batchId": "batch-v1-4e6b8ac84f87fe828dfc6fa7c2bd2cbc4efd017322d650913bcae10bec864ad6",
+  "batchId": "batch-v1-f74f263ac0f120c3af6837f4ed5c6cb5bdc22445ed55236e96253bc090e5d25d",
   "streamId": "1",
   "collectionJobId": "1",
   "analysisStartAt": "2026-08-23T15:00:20.000000Z",
@@ -732,7 +732,7 @@ JSON化は7.2節の`canonical-json-v1`に従う。
 - NaN、Infinity、`undefined`およびJSON numberをHash入力へ含めない
 
 PythonとTypeScriptの一致は、日本語、絵文字、結合文字、全JSON制御文字、U+2028、U+2029、
-quote、backslashおよびslashを含むgolden vectorのUTF-8 hexとSHA-256で検証する。
+U+FFFE、U+FFFF、quote、backslashおよびslashを含むgolden vectorのUTF-8 hexとSHA-256で検証する。
 
 `publishedAt`および`analysisStartAt`はUTC・小数秒6桁・末尾`Z`へ統一する。
 小数秒が6桁未満の場合は右側を0で埋め、7桁以上の場合はties-to-evenでマイクロ秒へ丸める。
@@ -741,6 +741,41 @@ quote、backslashおよびslashを含むgolden vectorのUTF-8 hexとSHA-256で�
 
 コメントの決定的ソートは`commentId`をUTF-8へ変換し、そのバイト列を符号なし辞書順で比較する。
 TypeScriptではlocaleやUTF-16 code unit順ではなく`Buffer.compare`相当を使用する。
+
+`canonical-json-v1`は`batchId`と`pageId`のHash入力専用であり、SQS MessageBodyの
+シリアライズ仕様ではない。有効なUnicode scalar valueであるU+FFFEとU+FFFFは
+`canonical-json-v1`では従来どおり直接UTF-8化し、既存のHash仕様を変更しない。
+
+SQS MessageBodyとBatch Outboxには別の`sqs-json-v1`を使用する。property順は本章の定義に固定し、
+基本のstring escapeは`canonical-json-v1`と同じとするが、SQSで直接許可されないU+FFFEとU+FFFFは
+それぞれASCIIの`\ufffe`と`\uffff`へescapeする。unpaired surrogateはescapeによる救済を行わず、
+入力検証で拒否する。制御文字はJSON escape、日本語、絵文字、結合文字、U+2028およびU+2029は
+直接UTF-8化する。JSON parse後はU+FFFEとU+FFFFを含む元の有効なUnicode文字列へ復元できる。
+
+PythonとTypeScriptでは、検証済みstring serializerを使用して同じproperty順で`sqs-json-v1`を生成する。
+完成後の文字列全体を言語標準のJSON serializerで再serializeしない。`payloadSha256`と921,600 bytesの
+上限判定は、U+FFFE/U+FFFFをescapeした後の実MessageBody UTF-8 bytesを対象とする。
+この追加規則の影響範囲はU+FFFEまたはU+FFFFを含むMessageBodyの`payloadSha256`と分割境界だけである。
+`batchId`は従来の`canonical-json-v1`を使用するため変化せず、それ以外の文字を含む既存Payload bytesも変化しない。
+
+Golden vector `unicode-boundary-v1`は、日本語、絵文字、結合文字、全JSON制御文字、U+2028、U+2029、
+U+FFFE、U+FFFF、quote、backslashおよびslashを同じ固定配列へ含める。PythonとTypeScriptで
+`canonical-json-v1`と`sqs-json-v1`それぞれのUTF-8 hexおよびSHA-256が一致すること、
+後者にU+FFFE/U+FFFFのUTF-8 bytesが残らず`\ufffe\uffff`が含まれることを検証する。
+
+```text
+["unicode-boundary-v1", "日本語", "😀", "e\u0301",
+ concat(U+0000, U+0001, ..., U+001F),
+ "\u2028\u2029", "\ufffe\uffff", "\"\\/"]
+```
+
+配列中のescape表記はJSON parse後の文字を表し、`concat`要素はU+0000からU+001Fまでを
+code point昇順で1つのstringへ連結する。空白なしでserializeした期待値は次のとおりとする。
+
+| Serializer | SHA-256 lowercase hex |
+| --- | --- |
+| `canonical-json-v1` | `acfd592182b424047bcdc960e76d98d9969436f15ca91bfcd4c4ae3043d1b85a` |
+| `sqs-json-v1` | `ca874589d4c62225e0cde40bcb4d7d101026e3ae88fa0a5c0f57c9582465253e` |
 
 ### 7.3. Page Snapshot
 
@@ -756,6 +791,7 @@ Page Snapshot schemaは`comment-page-v1`とする。
   "responseNextPageToken": "next-page-token",
   "observationStartedAt": "2026-08-23T15:00:20.123456Z",
   "pollingIntervalMillis": 5000,
+  "offlineAt": null,
   "comments": [
     {
       "commentId": "comment-001",
@@ -766,9 +802,11 @@ Page Snapshot schemaは`comment-page-v1`とする。
 }
 ```
 
-`requestPageToken`は初回だけNULL、その他のfieldは必須とする。
+`requestPageToken`は初回だけNULL、`offlineAt`はYouTube成功応答に値がない場合NULL、
+その他のfieldは必須とする。
 `responseNextPageToken`は継続取得可能な正常応答で非NULLの文字列とする。
 `pollingIntervalMillis`は0以上のsafe integerとする。
+`offlineAt`が非NULLの場合もコメントを破棄せず、同じSnapshotからBatchを生成する。
 
 `pageId`は`page-v1-`と、以下を`canonical-json-v1`でJSON化したUTF-8 bytesの
 SHA-256小文字hexを連結する。
@@ -788,6 +826,11 @@ Snapshotは`If-None-Match: *`で保存する。同じrequest identityで412と�
 既存objectをGETしてUTF-8、JSON schema、内部ID、Live Chat IDおよびrequest tokenを検証し、
 最初に保存されたSnapshotを正として再利用する。新しいYouTube応答が異なっても既存Snapshotを上書きしない。
 
+`snapshotSha256`はS3に保存されたSnapshot Objectの実UTF-8 bytesに対するSHA-256 lowercase hex 64文字とする。
+既存ObjectではS3 GETの実バイト列から再計算し、JSONを再serializeした結果を使用しない。
+一致しない場合は`OUTBOX_INTEGRITY`とする。request identityから算出する`pageId`、
+コメント内容から算出する`batchId`、最終MessageBodyから算出する`payloadSha256`とはHash対象が異なる。
+
 YouTube API応答後からSnapshotの最初の耐久保存前までの障害では再取得結果が変化し得る。
 外部APIとS3を同一トランザクションにできないため、この区間の完全なデータ保全は保証しない。
 
@@ -802,7 +845,7 @@ YouTube API応答後からSnapshotの最初の耐久保存前までの障害で�
 1. 正規化、重複排除およびUTF-8 byte順ソートを完了する
 2. 先頭から1コメントを追加した候補集合を作る
 3. 候補集合から7.1節の`batchId`を生成する
-4. 固定property順で完全な`comment-batch-v1` MessageBodyを生成する
+4. 固定property順と`sqs-json-v1`で完全な`comment-batch-v1` MessageBodyを生成する
 5. 921,600 bytes以下なら候補を採用し、次のコメントを試す
 6. 超過した場合は直前の候補を1 Batchとして確定し、未採用コメントから次Batchを開始する
 7. 1コメントだけでも超過する場合は本文を切り捨てず`MESSAGE_TOO_LARGE`とする
@@ -817,7 +860,8 @@ SQS `SendMessageBatch`を将来利用する場合は、最大10件の制約に�
 ### 7.5. Payload SHA-256とBatch Outbox
 
 `payloadSha256`は、`schemaVersion`、`batchId`、`streamId`、`collectionJobId`、
-`analysisStartAt`、`youtubeVideoId`および`comments`を含む最終MessageBodyのUTF-8 bytesに対する
+`analysisStartAt`、`youtubeVideoId`および`comments`を含み、`sqs-json-v1`で生成した
+最終MessageBodyのUTF-8 bytesに対する
 SHA-256小文字hex 64桁とする。`batchId`のHash対象とは異なる。
 
 Batch Outbox keyは次の形式とする。
