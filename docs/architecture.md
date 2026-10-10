@@ -41,7 +41,7 @@ PoC後に以下へ拡張可能な構成とする。
                          │ YouTube Data API │
                          └────────▲─────────┘
                                   │
-                                  │ OAuth 2.0
+                                  │ API Key / OAuth 2.0
                                   │
                          ┌────────┴─────────┐
                          │     Lambda       │
@@ -134,7 +134,11 @@ YouTubeから以下のデータを取得する。
 
 取得にはYouTube Data APIを利用する。
 
-Live Chat取得に必要なAPIについてはOAuth 2.0認可を利用する。
+公開・非所有ライブの読み取りではAPI Keyを第一候補とする。
+`videos.list`は公開情報の取得にAPI Keyを利用できるが、`liveChatMessages.list`については
+Google公式資料間でAPI Key対応の記述が一致していないため、実装開始前に4.3.10節の手順で実地検証する。
+検証に成功した場合はAPI Key方式を採用し、失敗した場合だけOAuth 2.0方式を再検討する。
+認証方式が確定するまでOAuth Client、Refresh TokenおよびAccess Token取得処理は実装しない。
 
 ---
 
@@ -162,9 +166,9 @@ streamId
 collectionJobId
 youtubeVideoId
 youtubeLiveChatId
-nextPageToken
-pollingInterval
-observationStartedAt
+streamStartWaitStartedAt（開始待ち中のみ）
+checkpoint
+pendingPage
 collectionStatus
 analysisStatus
 ```
@@ -180,13 +184,20 @@ Start
 Get Stream Metadata
 (Data Collector Lambda)
   ↓
-START_COLLECTION
-(Stream Metadata Lambda)
-  ↓
-internal streamId取得
-  ↓
-Collect Comments
-(Data Collector Lambda)
+streamStatus?
+  ├─ UPCOMING → Wait 30秒 → Get Stream Metadata
+  │             （最大30分、超過時は開始待ちTimeoutでFail）
+  ├─ ENDED    → 収集対象外として正常終了
+  ├─ LIVEかつLive Chat利用不可 → LIVE_CHAT_UNAVAILABLEでFail
+  └─ LIVEかつstartedAt / youtubeLiveChatIdあり
+  │             ↓
+  │           START_COLLECTION
+  │           (Stream Metadata Lambda)
+  │             ↓
+  │           internal streamId取得
+  │             ↓
+  │           Collect Comments
+  │           (Data Collector Lambda)
   ↓
 S3 OutboxへPayload保存
   ↓
@@ -244,7 +255,7 @@ YouTube Data APIから対象配信のデータを取得する。
 
 主な責務：
 
-- OAuth 2.0 Access Tokenの取得
+- 検証済みの認証方式によるYouTube Data APIアクセス（初期候補はAPI Key）
 - 終了時の最終メタデータ再取得（`videos.list`の`snippet,liveStreamingDetails`）
 - 配信情報取得
 - Live Chat ID取得
@@ -312,6 +323,375 @@ Step Functionsは`nextPageToken`を次の取得位置として採用する。
 
 Data Collector LambdaはYouTube Data APIへアクセスする必要があるため、
 Auroraへ直接接続せず、VPC外で実行する構成を基本とする。
+
+#### 4.3.1. 共通Contract
+
+Data Collector Lambdaの入力は`operation`を持つplain JSON objectとし、
+API Gateway形式の`statusCode` / `body`は使用しない。Operationは以下の4種類とする。
+
+| Operation | 目的 |
+| --- | --- |
+| `GET_STREAM_METADATA` | 初回の配信メタデータとLive Chat IDを取得する |
+| `COLLECT_COMMENTS` | 1ページを取得し、Page SnapshotとBatch Outboxを保存する |
+| `SEND_REGISTERED_BATCHES` | 登録済みDescriptorのOutbox PayloadをSQSへ送信する |
+| `GET_FINAL_STREAM_METADATA` | 終了時の最終配信メタデータを取得する |
+
+各Operationは定義されたfieldだけを受け付け、未知field、空文字、不正なID、
+不正なtimestampおよび条件不整合を外部APIやAWSサービスへ接続する前に拒否する。
+optional fieldは原則として使用せず、値が存在し得ないfieldは明示的な`null`とする。
+内部`streamId`と`collectionJobId`は`^[1-9][0-9]*$`、0を許容する件数は
+`^(0|[1-9][0-9]*)$`の10進JSON stringとし、JavaScript `number`へ変換しない。
+
+日時はUTCのRFC 3339文字列とする。Data Collectorが正規化して生成するtimestampは
+`YYYY-MM-DDTHH:mm:ss.ffffffZ`とし、7桁以上の小数秒はties-to-evenでマイクロ秒へ丸める。
+
+共通するエラー分類とStep Functionsの扱いは以下とする。
+
+| Classification | 主な条件 | Retry |
+| --- | --- | --- |
+| `VALIDATION` | Contract、ID、timestamp、field不正 | 不可 |
+| `YOUTUBE_AUTHENTICATION` | API KeyまたはToken不正 | 不可、運用対応 |
+| `YOUTUBE_AUTHORIZATION` | `forbidden`、scope不足 | 不可、運用対応 |
+| `YOUTUBE_QUOTA` | quota超過 | 短期Retry不可、運用判断 |
+| `YOUTUBE_TRANSIENT` | timeout、429、5xx、一時的通信障害 | Backoff付きRetry |
+| `LIVE_CHAT_UNAVAILABLE` | Live Chat無効・未取得・not found | 状態により待機または失敗 |
+| `LIVE_CHAT_ENDED` | Live Chat終了 | Retryせず終了処理へ進む |
+| `STREAM_START_TIMEOUT` | UPCOMINGの開始待ちが30分を超過 | Retryせず失敗 |
+| `S3_TRANSIENT` | S3 timeout、5xx、継続する409 | Retry可 |
+| `OUTBOX_CONFLICT` | 同一keyの内容またはrequest identity不整合 | 不可 |
+| `OUTBOX_INTEGRITY` | 保存済みbytesのSHA-256不一致 | 不可 |
+| `OUTBOX_EXPIRED` | 7日Lifecycle等によるobject欠落 | 不可、収集失敗 |
+| `SQS_TRANSIENT` | 明確な未送信となる一時障害 | 送信OperationだけRetry |
+| `SQS_SEND_OUTCOME_UNKNOWN` | timeout等で送信結果不明 | 同一Outboxを再送 |
+| `COMMENT_ID_CONFLICT` | 同じIDで本文または投稿日時が異なる | 不可 |
+| `MESSAGE_TOO_LARGE` | 1コメントで921,600 bytesを超える | 不可 |
+| `TIME_BUDGET` | 安全な完了に必要な残り時間がない | Operation単位でRetry |
+| `UNEXPECTED` | 分類不能な内部障害 | 原則失敗、調査対象 |
+
+ログにはOperation、AWS Request ID、内部ID、Batch ID、Page ID、件数、byte数、
+HTTP status、機密情報を含まない外部API error reason、Retry回数および処理時間だけを記録する。
+API Key、OAuth情報、YouTube APIレスポンス全体、コメント本文、SQS MessageBodyおよびLambda event全体は記録しない。
+
+#### 4.3.2. `GET_STREAM_METADATA`
+
+Input：
+
+```json
+{
+  "operation": "GET_STREAM_METADATA",
+  "youtubeVideoId": "youtube-video-id"
+}
+```
+
+Output：
+
+```json
+{
+  "youtubeVideoId": "youtube-video-id",
+  "youtubeChannelId": "UCxxxxxxxxxxxxxxxxxxxxxx",
+  "channelName": "チャンネル名",
+  "title": "配信タイトル",
+  "startedAt": "2026-08-23T14:58:00.000000Z",
+  "endedAt": null,
+  "youtubeLiveChatId": "youtube-live-chat-id",
+  "streamStatus": "LIVE"
+}
+```
+
+すべてのfieldを必須とし、`startedAt`、`endedAt`および`youtubeLiveChatId`はnullableとする。
+`streamStatus`は`UPCOMING`、`LIVE`または`ENDED`とする。
+`videos.list(part=snippet,liveStreamingDetails,id=<youtubeVideoId>)`を使用し、
+0件、複数件、要求IDと異なるID、必須property欠落を外部レスポンス不正として拒否する。
+`START_COLLECTION`は`streamStatus=LIVE`で`startedAt`と`youtubeLiveChatId`が非NULLの場合だけ呼び出す。
+同じVideo IDへのRetryは安全だが、YouTube側の状態変化によりOutputが変わり得る。
+
+Step Functionsは`streamStatus`により次のように分岐する。
+
+- `UPCOMING`：Collection Jobを作成せず30秒Wait後に同じVideo IDを再取得する。Step Functionsが最初の取得前に`streamStartWaitStartedAt`を一度だけ確定して保持し、その時点から30分を上限とする。超過時は`STREAM_START_TIMEOUT`で失敗する
+- `LIVE`：`startedAt`と`youtubeLiveChatId`が非NULLの場合だけ`START_COLLECTION`へ進む
+- `LIVE`で`startedAt`または`youtubeLiveChatId`がNULL：`LIVE_CHAT_UNAVAILABLE`として収集を開始せず失敗する
+- `ENDED`：新規Collection Jobを作成せず、収集対象外として正常終了する
+
+開始待ちの30秒間隔・最大30分はPoC初期値とし、Lambda内では待機しない。
+YouTube APIの一時エラーRetry時間も同じ30分の経過時間へ含め、Retryで開始時刻を更新しない。
+
+#### 4.3.3. `COLLECT_COMMENTS`
+
+Input：
+
+```json
+{
+  "operation": "COLLECT_COMMENTS",
+  "streamId": "1",
+  "collectionJobId": "1",
+  "youtubeVideoId": "youtube-video-id",
+  "youtubeLiveChatId": "youtube-live-chat-id",
+  "streamStartedAt": "2026-08-23T14:58:00.000000Z",
+  "checkpoint": {
+    "nextPageToken": null,
+    "observationStartedAt": null,
+    "pollingIntervalMillis": null,
+    "collectedCommentCount": "0"
+  }
+}
+```
+
+Output：
+
+```json
+{
+  "pendingPage": {
+    "requestPageToken": null,
+    "responseNextPageToken": "next-page-token",
+    "snapshotObjectKey": "outbox/youtube/collection-jobs/1/pages/page-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.json",
+    "snapshotSha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+    "observationStartedAt": "2026-08-23T15:00:20.123456Z",
+    "pollingIntervalMillis": 5000,
+    "offlineAt": null,
+    "collectedCommentCount": "120",
+    "batches": [
+      {
+        "batchId": "batch-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "outboxObjectKey": "outbox/youtube/collection-jobs/1/batches/batch-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.json",
+        "payloadSha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+      }
+    ]
+  }
+}
+```
+
+`checkpoint.nextPageToken`、`checkpoint.observationStartedAt`および
+`checkpoint.pollingIntervalMillis`はnullable、その他のfieldは必須とする。
+`pendingPage.offlineAt`もnullableとし、YouTube成功応答に`offlineAt`が存在する場合は
+UTC・小数秒6桁・末尾`Z`へ正規化して設定する。
+`pollingIntervalMillis`は0以上のsafe integerとし、Step FunctionsのWaitでは秒へ切り上げる。
+初回要求ではYouTube API要求直前のUTC時刻を候補として保持し、正常応答時だけ
+`pendingPage.observationStartedAt`へ設定する。2回目以降はcheckpointの同じ値を引き継ぐ。
+`collectedCommentCount`は10進文字列の累積件数とし、Lambda内で`BigInt`加算する。
+Batch Payloadの`analysisStartAt`は`streamStartedAt`と確定した`observationStartedAt`の遅い方とし、
+Stream Metadata Lambdaも`REGISTER_BATCHES`で同じ値を独立に算出して永続化する。
+
+`liveChatMessages.list(part=id,snippet,liveChatId=<youtubeLiveChatId>)`を使用し、
+2回目以降は`pageToken=checkpoint.nextPageToken`を指定する。
+`textMessageEvent`だけを抽出して正規化し、4.3.6節のPage Snapshotを保存した後、
+`data-model.md`の7章に従ってBatch Outboxを生成する。
+Snapshotと全Batch Outboxの保存が完了する前に成功Outputを返さない。
+
+同じcheckpointからのRetryでは、決定的なSnapshot keyを最初に確認し、保存済みならYouTube APIを再取得しない。
+Snapshotがまだ存在しない場合だけ再取得する。YouTube API応答後から最初のSnapshot保存前までの障害では、
+再取得結果が変化し得るため完全なデータ保全を保証できない。
+
+#### 4.3.4. `SEND_REGISTERED_BATCHES`
+
+Input：
+
+```json
+{
+  "operation": "SEND_REGISTERED_BATCHES",
+  "streamId": "1",
+  "collectionJobId": "1",
+  "registeredBatchCount": 0,
+  "pendingPage": {
+    "requestPageToken": null,
+    "responseNextPageToken": "next-page-token",
+    "snapshotObjectKey": "outbox/youtube/collection-jobs/1/pages/page-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.json",
+    "snapshotSha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+    "observationStartedAt": "2026-08-23T15:00:20.123456Z",
+    "pollingIntervalMillis": 5000,
+    "offlineAt": null,
+    "collectedCommentCount": "120",
+    "batches": []
+  }
+}
+```
+
+Output：
+
+```json
+{
+  "sentBatchCount": 0,
+  "offlineAt": null,
+  "checkpoint": {
+    "nextPageToken": "next-page-token",
+    "observationStartedAt": "2026-08-23T15:00:20.123456Z",
+    "pollingIntervalMillis": 5000,
+    "collectedCommentCount": "120"
+  }
+}
+```
+
+すべてのfieldを必須とし、`requestPageToken`と`offlineAt`だけをnullableとする。
+`registeredBatchCount`は0以上のsafe integerで、`pendingPage.batches.length`との一致を必須とする。
+空配列かつ登録数0はSQSを呼ばず成功とする。
+Outputの`offlineAt`は入力`pendingPage.offlineAt`を変更せず返す。
+
+送信前にSnapshotと各OutboxをGETし、実バイト列のSHA-256、key内の内部IDとBatch ID、
+Payload内の`streamId`、`collectionJobId`および`batchId`を検証する。
+SQSへは原則として`SendMessage`で1件ずつ送信する。このOperationではYouTube APIを呼び出さない。
+一部成功、送信結果不明、Task成功応答前の障害では同じ全Descriptorを再送してよい。
+Standard Queueの重複とAnalyzerの冪等性によって同じ結果へ収束させる。
+
+`registeredBatchCount`はDB登録の暗号学的証明ではない。登録済み保証は、
+Step Functionsの状態遷移、Stream Metadata Lambdaの`REGISTER_BATCHES`検証、同一Descriptorの受け渡し、
+および4.3.8節のIAM境界を組み合わせて成立させる。
+
+#### 4.3.5. `GET_FINAL_STREAM_METADATA`
+
+Input：
+
+```json
+{
+  "operation": "GET_FINAL_STREAM_METADATA",
+  "youtubeVideoId": "youtube-video-id"
+}
+```
+
+Output：
+
+```json
+{
+  "youtubeVideoId": "youtube-video-id",
+  "title": "最終配信タイトル",
+  "startedAt": "2026-08-23T14:58:00.000000Z",
+  "endedAt": "2026-08-23T17:00:00.000000Z",
+  "streamStatus": "ENDED"
+}
+```
+
+すべてのfieldを必須とし、`endedAt`だけをnullableとする。
+`videos.list(part=snippet,liveStreamingDetails,id=<youtubeVideoId>)`で最新値を取得する。
+`endedAt=null`の場合はYouTube側の反映待ちとしてStep Functionsが30秒Wait後に再試行する。
+既存設計どおり初回を含め最大5回とし、取得不能時は`STOP_COLLECTION`へFAILEDとNULLの終了日時を渡す。
+
+#### 4.3.6. Page Snapshot
+
+YouTube APIの1回の正常応答は、Batch生成前に次のkeyへ保存する。
+
+```text
+outbox/youtube/collection-jobs/<collectionJobId>/pages/<pageId>.json
+```
+
+`pageId`は`page-v1-`と、次の固定配列を`canonical-json-v1`でJSON化したUTF-8バイト列の
+SHA-256小文字hex 64桁を連結する。
+
+```text
+["page-v1", streamId, collectionJobId, youtubeLiveChatId,
+ requestPageTokenOrEmptyString]
+```
+
+Snapshot schemaは`comment-page-v1`とし、`schemaVersion`、要求時と応答時のPage Token、
+`observationStartedAt`、`pollingIntervalMillis`、nullableな`offlineAt`および正規化済みコメントを含める。
+コメントには`commentId`、`text`および`publishedAt`だけを含める。
+
+`snapshotSha256`は、S3へ保存されたSnapshot Objectの実UTF-8 bytesを対象とする
+SHA-256のlowercase hexadecimal 64文字とする。既存Objectを再利用する場合は、S3 GETで取得した
+実バイト列から再計算する。JSONをparse後に再serializeしたbytesでHashを検証してはならない。
+不一致は`OUTBOX_INTEGRITY`として失敗する。`pageId`はrequest identityのHash、
+`snapshotSha256`は保存Object bytesのHashであり、目的とHash対象が異なる。
+
+`PutObject`は`If-None-Match: *`を使用する。同じrequest identityのSnapshotが既に存在する場合は、
+既存objectの実バイト列、schema、内部ID、Live Chat IDおよび`requestPageToken`を検証して再利用し、
+新しく取得した結果は破棄する。並列実行では最初に保存が完了したSnapshotを正とする。
+
+#### 4.3.7. CheckpointとPendingPage
+
+Step Functionsは確定済み状態を`checkpoint`、未送信の取得結果を`pendingPage`として分離する。
+
+```json
+{
+  "checkpoint": {
+    "nextPageToken": null,
+    "observationStartedAt": null,
+    "pollingIntervalMillis": null,
+    "collectedCommentCount": "0"
+  },
+  "pendingPage": null
+}
+```
+
+処理順序は次に固定する。
+
+```text
+COLLECT_COMMENTS
+  → Page Snapshot保存
+  → 全Batch Outbox保存
+  → REGISTER_BATCHES
+  → SEND_REGISTERED_BATCHES
+  → checkpoint確定、pendingPage破棄
+```
+
+`REGISTER_BATCHES`成功前はSQSへ送信しない。全BatchのSQS送信成功前は
+`responseNextPageToken`、累積件数およびポーリング間隔をcheckpointへ反映しない。
+送信失敗・結果不明時は`pendingPage`を維持し、送信Operationだけを再試行する。
+
+YouTube成功応答に`offlineAt`がある場合も、コメントを含むSnapshotと全Batch Outboxを保存し、
+`REGISTER_BATCHES`と全BatchのSQS送信を完了してcheckpointを確定する。その後、
+`SEND_REGISTERED_BATCHES`が返した非NULLの`offlineAt`をChoiceで判定し、Waitや次ページ取得を挟まず
+`GET_FINAL_STREAM_METADATA`へ進む。`offlineAt`を`streams.endedAt`の代用には使用しない。
+
+`liveChatEnded`エラーは`pendingPage=null`の状態で開始した`COLLECT_COMMENTS`から返された場合だけ
+終了処理へ進める。`pendingPage`が存在する間は同Operationを呼ばず、登録・送信・checkpoint確定を
+完了するまで終了分岐を評価しない。
+
+#### 4.3.8. Step FunctionsとIAMの境界
+
+Data CollectorはDBの登録状態を直接確認しない。Step Functionsは`REGISTER_BATCHES`成功時に返された
+`registeredBatchCount`と元のDescriptor配列を同じ送信入力へ渡し、送信Operationは件数と配列長を検証する。
+
+送信Stateは`REGISTER_BATCHES`の成功分岐からだけ到達可能とする。
+State Machine実行Roleには対象Data Collector LambdaとStream Metadata LambdaのInvokeだけを許可する。
+Data Collector Lambdaには広いprincipalを許可するresource-based policyを追加せず、同一account内の
+IAM identity policyで対象State Machine実行Roleおよび明示した運用RoleだけにInvokeを許可する。
+Data Collector実行RoleにはAurora、
+`rds-db:*`、`rds-data:*`およびVPC ENI操作を許可しない。
+
+この境界は悪意ある呼び出し元に対する暗号学的証明ではない。
+署名付き登録receiptやDB照会APIは既存Contract変更と複雑性を伴うためPoCでは採用しない。
+
+#### 4.3.9. 障害復旧
+
+| 障害位置 | 復旧方法 |
+| --- | --- |
+| YouTube応答後、Snapshot保存前 | 同じcheckpointから再取得。結果変化の可能性が残る |
+| Snapshot Put結果不明 | 決定的keyをGETし、存在すれば検証して再利用する |
+| Snapshot保存後、Batch保存途中 | Snapshotから全Batchを再生成し、不足objectだけ保存する |
+| Batch保存後、登録前 | 同じDescriptorで`REGISTER_BATCHES`を実行する |
+| 登録Commit結果不明 | 同一入力で`REGISTER_BATCHES`を再実行する |
+| 登録成功後、送信前 | `SEND_REGISTERED_BATCHES`だけを実行する |
+| SQS部分成功・結果不明 | 全Descriptorを同じOutboxから再送する |
+| SQS成功後、checkpoint確定前 | pendingPageを維持して再送後、同じcheckpointを確定する |
+| `offlineAt`を含む成功応答 | Snapshot、登録、送信、checkpoint確定後に最終メタデータ取得へ進む |
+| `liveChatEnded`エラー | pendingPageがない場合だけ最終メタデータ取得へ進む |
+| Outbox欠落・7日Lifecycle期限切れ | YouTubeから再生成せず`OUTBOX_EXPIRED`で収集を失敗させる |
+
+YouTube API応答と最初のS3保存は同一トランザクションにできず、投稿者またはmoderatorによる
+コメント削除も起こり得るため、YouTube上に一時的に存在した全コメントの完全収集は保証しない。
+耐久保存済みSnapshot以降について、取得位置の先行、未登録送信および二重集計を防止する。
+
+#### 4.3.10. YouTube API認証の検証
+
+`videos.list`は公開動画の`snippet,liveStreamingDetails`取得にAPI Keyを使用する。
+`liveChatMessages.list`はGoogle公式のData API共通説明およびLive Chat streaming sampleでは
+API Keyを利用可能と読める一方、Live Streaming APIのCredential説明には全methodでOAuth必須との記載がある。
+そのため、公開・非所有ライブに対して次の実地検証を行うまでAPI Key方式を確定しない。
+
+根拠とするGoogle公式資料：
+
+- [YouTube Data API v3 Overview](https://developers.google.com/youtube/v3/docs)
+- [`videos.list`](https://developers.google.com/youtube/v3/docs/videos/list)
+- [`liveChatMessages.list`](https://developers.google.com/youtube/v3/live/docs/liveChatMessages/list)
+- [Stream live chat](https://developers.google.com/youtube/v3/live/streaming-live-chat)
+- [Authorizing Live Streaming API Requests](https://developers.google.com/youtube/v3/live/registering_an_application)
+
+1. YouTube Data API v3だけに制限したAPI Keyを用意する
+2. Live Chatが有効な公開・非所有ライブを選ぶ
+3. API Keyだけで`videos.list`を実行し、`activeLiveChatId`を確認する
+4. 同じAPI Keyで`liveChatMessages.list(part=id,snippet)`を実行する
+5. `pollingIntervalMillis`経過後、返却された`nextPageToken`で2回目を実行する
+6. 200応答と必要fieldに加え、配信終了時に`offlineAt`または`liveChatEnded`を確認できればAPI Key方式を採用する
+7. 認証・認可エラーになる場合は最小のread-only scopeによるOAuth方式を再検討する
+
+検証完了までOAuth Client、Refresh Token管理およびToken更新処理を実装しない。
 
 ---
 
@@ -444,7 +824,7 @@ Input：
   "batches": [
     {
       "batchId": "batch-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-      "outboxObjectKey": "outbox/1/batch-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.json",
+      "outboxObjectKey": "outbox/youtube/collection-jobs/1/batches/batch-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.json",
       "payloadSha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
     }
   ]
@@ -838,9 +1218,11 @@ Data Collector Lambda
        ↓
 YouTube Data API
        ↓
-Comments + nextPageToken
+Comments + responseNextPageToken
        ↓
-S3 OutboxへPayload保存
+S3 Page Snapshotへ取得結果を固定
+       ↓
+S3 Batch Outboxへ全Payload保存
        ↓
 Stream Metadata Lambda
        ↓
@@ -877,8 +1259,9 @@ Stream Metadata Lambdaへ渡し、`collection_job_batches`へ一つのトラン�
 送信成功応答を失った場合もYouTube APIを再取得せず、同じPayloadを再送信する。
 全バッチの送信成功を確認できるまで取得位置を進めない。
 
-次回取得位置を示す`nextPageToken`はStep Functionsの実行状態として保持し、
-次回のLambda呼び出しへ引き継ぐ。
+Step Functionsは確定済み取得位置を`checkpoint`、取得済みで未送信の結果を`pendingPage`として保持する。
+`responseNextPageToken`は全登録済みBatchの送信成功後にだけ`checkpoint.nextPageToken`へ反映し、
+次回のLambda呼び出しへ引き継ぐ。送信失敗時は`pendingPage`を維持し、YouTube APIを再取得しない。
 
 この処理を配信またはLive Chatが終了するまで繰り返す。
 

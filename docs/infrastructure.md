@@ -37,7 +37,7 @@ PoCでは以下のAWSサービスを利用する。
 | Raw Data保存                | Amazon S3                              |
 | 分析結果保存                | Amazon Aurora Serverless v2 PostgreSQL |
 | API Key管理                 | AWS Systems Manager Parameter Store    |
-| OAuth・DB管理者認証情報管理 | AWS Secrets Manager                    |
+| DB管理者認証情報管理（OAuth採用時はOAuth情報も含む） | AWS Secrets Manager |
 | DBスキーマ適用              | Amazon RDS Data API                    |
 | ログ・監視                  | Amazon CloudWatch                      |
 | コスト監視                  | AWS Budgets                            |
@@ -91,7 +91,7 @@ PoCでは以下のAWSサービスを利用する。
                       │ Data Collector  │
                       │ Lambda          │
                       └───────┬─────────┘
-                              │ OAuth 2.0
+                              │ API Key / OAuth 2.0
                               ▼
                       ┌─────────────────┐
                       │ YouTube Data API│
@@ -324,7 +324,7 @@ PoCでは以下のLambda Functionを作成する。
 役割：
 
 - YouTube Data APIへのアクセス
-- OAuth 2.0 Access Tokenの取得
+- 検証済みの認証方式によるYouTube Data APIアクセス（初期候補はAPI Key）
 - 配信情報取得
 - Live Chat ID取得
 - コメント取得
@@ -342,6 +342,31 @@ PoCでは以下のLambda Functionを作成する。
 stream-insight-data-collector
 ```
 
+初期設定値：
+
+| 項目 | 設定値 |
+| --- | ---: |
+| Runtime | Node.js 24.x |
+| Memory | 512 MB |
+| Timeout | 60秒 |
+| Reserved Concurrency | 2 |
+| Log retention | 7日 |
+| VPC | 配置しない |
+
+Environment Variableには機密値を直接設定せず、次のResource名と非機密設定だけを渡す。
+
+```text
+RAW_DATA_BUCKET_NAME
+COMMENT_QUEUE_URL
+YOUTUBE_AUTH_MODE=API_KEY
+YOUTUBE_API_KEY_PARAMETER_NAME=/stream-insight/<environment>/youtube/api-key
+MAX_MESSAGE_BODY_BYTES=921600
+NODE_OPTIONS=--enable-source-maps
+```
+
+`YOUTUBE_AUTH_MODE`は公開・非所有ライブに対するAPI Key実地検証成功後に確定する。
+検証完了まではOAuth用Environment Variable、SecretおよびToken更新処理を追加しない。
+
 Data Collector LambdaはYouTube Data APIへアクセスするため、
 VPC外へ配置する。
 
@@ -352,8 +377,9 @@ VPC外へ配置する。
 
 継続取得に必要な`nextPageToken`等はStep Functionsへ返却する。
 
-取得したコメントは、内部`streamId`、`collectionJobId`および`batchId`を含む
-SQS送信用Payloadとして、送信前にS3 Outboxへ保存する。
+取得したコメントは最初にPage SnapshotとしてS3へ固定する。
+そのSnapshotから内部`streamId`、`collectionJobId`および`batchId`を含む
+SQS送信用Payloadを決定的に生成し、送信前にS3 Batch Outboxへ保存する。
 Data Collectorは`batchId`、Outboxオブジェクトキー、Payload SHA-256をStep Functionsへ返す。
 
 Step FunctionsはStream Metadata Lambdaによる`collection_job_batches`への登録完了後、
@@ -578,13 +604,12 @@ Start
 Get Stream Metadata
 (Data Collector Lambda)
   ↓
-START_COLLECTION
-(Stream Metadata Lambda)
-  ↓
-internal streamId
-  ↓
-Collect Comments
-(Data Collector Lambda)
+streamStatus?
+  ├── UPCOMING → Wait 30秒 → Get Stream Metadata（最大30分）
+  ├── ENDED → Collection Jobを作成せず正常終了
+  ├── LIVEかつLive Chat利用不可 → Fail
+  └── LIVEかつ必須fieldあり → START_COLLECTION → internal streamId → Collect Comments
+                                                        (Data Collector Lambda)
   ↓
 Save Outbox Payload
 (S3)
@@ -595,30 +620,28 @@ REGISTER_BATCHES
 Send Registered Payload
 (Data Collector Lambda → SQS)
   ↓
-Live Chat終了？
-  ├── Yes
-  │     ↓
-  │    Get Final Stream Metadata (Data Collector Lambda)
-  │     ↓
-  │    STOP_COLLECTION (Stream Metadata Lambda)
-  │     ↓
-  │    collectionStatus?
-  │      ├── FAILED → analysisStatus=FAILED → Fail
-  │      └── COMPLETED
-  │           ↓
-  │          Finalize Analysis (Analysis Finalizer Lambda)
-  │           ↓
-  │          未処理バッチあり？
-  │            ├── Yes → Wait 10秒 → Finalize Analysis
-  │            └── No  → analysisStatus=COMPLETED → End
-  │
-  └── No
+Checkpoint確定
+  ↓
+offlineAtあり？
+  ├── No → Wait → Collect Comments → ...
+  └── Yes ──────────────────────────────┐
+                                       │
+COLLECT_COMMENTSのLIVE_CHAT_ENDED Catch │
+（pendingPageがない場合だけ）───────────┘
+  ↓
+Get Final Stream Metadata (Data Collector Lambda)
+  ↓
+STOP_COLLECTION (Stream Metadata Lambda)
+  ↓
+collectionStatus?
+  ├── FAILED → analysisStatus=FAILED → Fail
+  └── COMPLETED
         ↓
-       Wait
+       Finalize Analysis (Analysis Finalizer Lambda)
         ↓
-Collect Comments
-        ↓
-       ...
+       未処理バッチあり？
+         ├── Yes → Wait 10秒 → Finalize Analysis
+         └── No  → analysisStatus=COMPLETED → End
 ```
 
 Data Collector LambdaおよびStream Metadata Lambdaから返却された
@@ -629,9 +652,9 @@ streamId
 collectionJobId
 youtubeVideoId
 youtubeLiveChatId
-nextPageToken
-pollingInterval
-observationStartedAt
+streamStartWaitStartedAt（開始待ち中のみ）
+checkpoint
+pendingPage
 collectionStatus
 analysisStatus
 ```
@@ -646,11 +669,21 @@ Stream Metadata Lambdaが`collection_jobs.observationStartedAt`と
 `analysisStartAt`は`streams.startedAt`と`observationStartedAt`の遅い方とする。
 取得コメントが0件の場合もこの保存処理を実行する。
 
+`GET_STREAM_METADATA`が`UPCOMING`を返した場合は30秒間隔で再取得し、最初の取得から30分で
+`STREAM_START_TIMEOUT`とする。`ENDED`はCollection Jobを作成せず正常終了する。
+`LIVE`でも`startedAt`または`youtubeLiveChatId`がない場合は`LIVE_CHAT_UNAVAILABLE`で失敗する。
+開始待ちの基準はStep Functionsが最初の取得前に一度だけ確定する`streamStartWaitStartedAt`とし、
+YouTube APIの一時エラーRetryを含めて30分を超えた場合に終了する。Retryで基準時刻を更新しない。
+
+コメント取得の成功応答に`offlineAt`が含まれる場合も、Snapshot、Batch登録、SQS送信、
+checkpoint確定を完了してから最終メタデータ取得へ進む。`liveChatEnded`エラーによる終了遷移は
+未処理の`pendingPage`がない場合だけ許可する。
+
 ---
 
 ### 7.3. Wait
 
-Data Collector Lambdaから取得したポーリング間隔を考慮して、
+Data Collector Lambdaから取得した`checkpoint.pollingIntervalMillis`を秒へ切り上げて、
 次回のLambda実行までWaitする。
 
 短時間にYouTube Data APIを過剰に呼び出さないようにする。
@@ -715,6 +748,22 @@ Queue名：
 stream-insight-comment-queue
 ```
 
+初期設定値：
+
+| 項目 | 設定値 | 確定状態 |
+| --- | ---: | --- |
+| Queue type | Standard | 確定 |
+| Message retention | 4日 | 確定 |
+| Server-side encryption | SSE-SQS | 確定 |
+| Visibility timeout | 360秒 | 暫定 |
+| Maximum message body | 921,600 bytes | 確定 |
+| Redrive `maxReceiveCount` | 5 | 暫定 |
+
+Visibility timeout 360秒はAnalyzer Lambda timeout 60秒の6倍を前提とする。
+Analyzer実装Issueで実際のtimeoutとBatch windowを確定した後、timeoutの6倍以上に
+Batch windowを加えた値となることを再確認する。`maxReceiveCount=5`もAnalyzerの
+エラー分類、平均処理時間およびDB Retry方針を確認して最終決定する。
+
 用途：
 
 - データ収集処理と分析処理の疎結合
@@ -723,6 +772,11 @@ stream-insight-comment-queue
 - Analyzer Lambdaへのイベント通知
 
 PoCでは複数コメントを1つのSQSメッセージとして送信する。
+
+Data Collectorは原則として`SendMessage`で1 messageずつ送信する。
+将来`SendMessageBatch`を使用する場合、最大10件という件数制約だけでなく、
+各messageと1 request内の全MessageBody合計がともに1,048,576 bytes以下であることを検証する。
+900 KiB級messageを含むrequestは実質1件ずつ送信する。
 
 SQSメッセージには対象配信を識別する内部`streamId`と、
 コメントバッチを一意に識別する`batchId`を含める。
@@ -734,7 +788,8 @@ Analyzer Lambda側で`batchId`を利用した冪等性制御を行う。
 完了した後にだけ送信する。
 
 Analyzer LambdaのEvent Source Mappingでは
-Partial Batch Responseを有効化する。
+Partial Batch Responseを有効化し、`BatchSize=1`とする。
+900 KiBのMessageBodyを許容するため、Lambda invoke payload内で複数の大容量messageを束ねない。
 
 同Event Source MappingのMaximum Concurrencyは2、
 Analyzer LambdaのReserved Concurrencyも2に設定する。
@@ -753,6 +808,9 @@ stream-insight-comment-dlq
 ```
 
 一定回数処理に失敗したメッセージをDLQへ移動する。
+DLQのMessage retentionは14日、Server-side encryptionはSSE-SQSとする。
+Standard Queueでは元のenqueue timestampを基準に期限切れとなるため、
+DLQ retentionはSource Queueの4日より長く設定する。
 
 ---
 
@@ -770,13 +828,19 @@ stream-insight-raw-<account-id>
 
 ```text
 outbox/
-└── youtube/collection-jobs/<collection-job-id>/batches/<batch-id>.json
+└── youtube/collection-jobs/<collection-job-id>/
+    ├── pages/<page-id>.json
+    └── batches/<batch-id>.json
 
 raw/
 └── youtube/streams/<stream-id>/batches/<batch-id>.jsonl
 ```
 
-`outbox/`にはData Collector LambdaがSQS送信前のPayloadを条件付き書き込みで保存する。
+`pages/`にはYouTube APIの取得結果をBatch生成前にPage Snapshotとして条件付き書き込みで保存する。
+同じrequest identityのSnapshotが存在する場合は、既存objectの内容とidentityを検証し、
+最初に保存されたSnapshotを再利用する。
+
+`batches/`にはData Collector LambdaがSQS送信前のPayloadを条件付き書き込みで保存する。
 同じキーが既に存在する場合はPayload SHA-256が一致するときだけ再利用し、
 異なる場合は上書きせず失敗させる。
 
@@ -1579,20 +1643,30 @@ AWS Systems Manager Parameter StoreとAWS Secrets Managerを利用する。
 
 ### 13.1. YouTube Data API Key
 
-YouTube Data API KeyはParameter Storeで管理する。
+YouTube Data API KeyはParameter Storeの`SecureString`で管理する。
 
 例：
 
 ```text
-/stream-insight/youtube/api-key
+/stream-insight/<environment>/youtube/api-key
 ```
 
-Data Collector LambdaはIAM Role経由でParameter Storeへアクセスする。
+Parameter値はCDKで作成・更新せず、安全な運用手順によって事前投入した既存Parameterを参照する。
+CDKからLambdaへ渡すのはParameter名だけとし、API Keyの値をCDK context、`cdk.json`、
+CloudFormation Output、Lambda Environment Variableまたはソースコードへ含めない。
+
+Data Collector LambdaはIAM Role経由で実行時に`GetParameter(WithDecryption=true)`を呼び出し、
+取得値をLambda実行環境内だけでキャッシュする。権限は対象Parameter ARNへ限定する。
+Customer Managed KMS Keyを使用する場合だけ、対象Keyへの`kms:Decrypt`も付与する。
 
 ### 13.2. YouTube OAuth 2.0
 
-YouTube Live Chat取得にOAuth 2.0認可が必要となるため、
-Data Collector Lambdaから利用する認証情報を安全に管理する。
+公開・非所有ライブの取得ではAPI Keyを第一候補とするが、`liveChatMessages.list`のAPI Key対応は
+Google公式資料だけでは確定できない。`architecture.md`の4.3.10節に定義した実地検証が失敗した場合だけ、
+最小のread-only scopeによるOAuth 2.0方式を再検討する。
+
+認証方式確定まではOAuth Client、Refresh Token、Access Token取得処理およびOAuth用Secretを作成しない。
+OAuth方式を採用する場合は、Data Collector Lambdaから利用する認証情報を次の方針で安全に管理する。
 
 PoCでは初回認可を開発者または運用者が手動で実施する。
 
@@ -1671,9 +1745,14 @@ S3 PutObject / GetObject
 Resource: <Raw Data Bucket ARN>/outbox/*
 SQS SendMessage
 SSM GetParameter
-Secrets Manager GetSecretValue
+Resource: <API Key SecureString Parameter ARN>
+KMS Decrypt: Customer Managed KMS Keyを使用する場合だけ対象Key ARN
+Secrets Manager GetSecretValue: OAuth採用時だけ対象Secret ARN
 CloudWatch Logs
 ```
+
+Data Collector Lambdaには`rds-db:*`、`rds-data:*`、Aurora管理者Secretへのアクセス、
+VPC ENI管理権限を付与しない。S3権限は`outbox/*`、SQS権限は対象Comment Queueだけに限定する。
 
 ### Stream Metadata Lambda
 
@@ -1701,13 +1780,17 @@ VPC Lambdaに必要な`ec2:CreateNetworkInterface`、`ec2:DescribeNetworkInterfa
 以下は後続のAnalyzer Lambda実装Issueで設定する。
 
 ```text
-SQS ReceiveMessage
-SQS DeleteMessage
+sqs:ReceiveMessage
+sqs:DeleteMessage
+sqs:GetQueueAttributes
+Resource: <Comment Queue ARN>
 S3 PutObject
 rds-db:connect
 Resource: arn:aws:rds-db:<region>:<account-id>:dbuser:<cluster-resource-id>/analyzer_user
 CloudWatch Logs
 ```
+
+Comment QueueはSSE-SQSを使用するため、Analyzer LambdaにはSQS暗号化用の`kms:Decrypt`を付与しない。
 
 ### Analysis Finalizer Lambda
 
@@ -1752,8 +1835,16 @@ Aurora管理者Secretへのアクセスを許可しない。
 
 ```text
 Lambda InvokeFunction
+Resource: 対象Data Collector Lambda / Stream Metadata Lambda / 後続Workflow Lambdaのみ
 CloudWatch Logs
 ```
+
+Data Collector LambdaおよびStream Metadata LambdaのInvoke権限は、対象State Machine実行Roleに限定する。
+`SEND_REGISTERED_BATCHES`はState Machine内で`REGISTER_BATCHES`成功分岐からだけ到達可能とし、
+広いprincipalを許可するLambda resource-based policyは追加しない。人間または他サービスによる
+直接Invokeは、同一account内のIAM identity policyで明示した運用Roleを除いて許可しない。
+`registeredBatchCount`は登録済みの暗号学的証明ではないため、状態遷移、同一Descriptorの受け渡し、
+Lambda側の入力検証およびこのIAM境界を組み合わせて未登録送信を防止する。
 
 S3 Gateway VPC EndpointのEndpoint Policyでは、
 Raw Data Bucketへの必要なアクセスのみを許可する。
@@ -1991,7 +2082,7 @@ PoCでは以下のStack構成を基本とする。
 - API Gateway Access Log Group
 - Step Functions Log Group
 - Parameter Store
-- YouTube OAuth用Secrets Manager Secret
+- YouTube API Key Parameter名の参照（OAuth採用時だけOAuth用Secrets Manager Secret）
 - Lambda実行RoleおよびDBユーザー単位の`rds-db:connect` Policy（後続のApplication Lambda実装Issueで追加）
 - CloudWatch Alarm
 - AWS Budget
@@ -2007,9 +2098,17 @@ Database endpoint、port、DB Cluster Resource ID、IAM connect grantおよびSe
 公開済みDatabaseClusterから取得する。Aurora Security GroupやResource IDを新たな
 `public readonly` propertyとして公開しない。
 
+Data Collector Lambda用には、`BackendStackProps`へ`rawDataBucket: s3.IBucket`を追加し、
+StorageStackが`public readonly rawDataBucket`として公開するBucketを`stream-insight.ts`から渡す。
+Data Collectorの`RAW_DATA_BUCKET_NAME`には`rawDataBucket.bucketName`を設定する。
+実行Roleには対象Bucketの`outbox/*`に対する`s3:PutObject`と`s3:GetObject`だけを付与し、
+`raw/*`や他Bucketへの権限は付与しない。これによりBucket参照による
+BackendStack → StorageStackの既存依存関係へ統合し、名前による再検索や手動ARN構築を行わない。
+
 BackendStack内では`DatabaseMigration` Custom Resourceを参照可能なconstructとして保持し、
 Stream Metadata Lambdaから明示依存を設定する。Stack間依存はVPCとApplication Security Groupの参照による
-BackendStack → NetworkStack、およびDatabaseCluster参照によるBackendStack → StorageStackとする。
+BackendStack → NetworkStack、およびDatabaseClusterとRaw Data Bucket参照による
+BackendStack → StorageStackとする。
 
 CloudWatch Log Groupsには以下を設定する。
 
@@ -2019,7 +2118,7 @@ Removal Policy: DESTROY
 ```
 
 Analyzer LambdaのSQS Event Source Mappingでは
-Partial Batch Responseを有効化し、Maximum Concurrencyを2に設定する。
+Partial Batch Responseを有効化し、Batch Sizeを1、Maximum Concurrencyを2に設定する。
 
 Analyzer LambdaにはReserved Concurrencyとして2を設定する。
 
