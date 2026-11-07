@@ -36,6 +36,27 @@ test('S3 GetObject treats a missing key as absent and preserves authorization fa
     error instanceof DataCollectorError && error.classification === 'AWS_AUTHORIZATION');
 });
 
+test('S3 GetObject classifies a response body connection reset as transient', async () => {
+  const interruptedBody = { send: async () => ({ Body: { transformToByteArray: async () => {
+    throw Object.assign(new Error('stream interrupted'), { code: 'ECONNRESET' });
+  } } }) } as unknown as S3Client;
+  await assert.rejects(() => new S3ObjectStore(interruptedBody, 'bucket').get('outbox/object.json'),
+    (error: unknown) => error instanceof DataCollectorError && error.classification === 'S3_TRANSIENT' &&
+      error.externalReason === 'ECONNRESET');
+});
+
+test('S3 PutObject retries only recognized status-less transport errors', async () => {
+  const connectionReset = { send: async () => {
+    throw Object.assign(new Error('connection reset'), { code: 'ECONNRESET' });
+  } } as unknown as S3Client;
+  await assert.rejects(() => new S3ObjectStore(connectionReset, 'bucket').putIfAbsent('outbox/object.json', Buffer.from('{}')),
+    (error: unknown) => error instanceof DataCollectorError && error.classification === 'S3_TRANSIENT');
+
+  const unknown = { send: async () => { throw new Error('program error'); } } as unknown as S3Client;
+  await assert.rejects(() => new S3ObjectStore(unknown, 'bucket').putIfAbsent('outbox/object.json', Buffer.from('{}')),
+    (error: unknown) => error instanceof DataCollectorError && error.classification === 'UNEXPECTED');
+});
+
 test('S3 conditional Put treats 412 as an existing immutable object', async () => {
   const client = new FakeS3Client([412]);
   assert.equal(await store(client).putIfAbsent('outbox/key.json', Buffer.from('{}')), 'exists');

@@ -73,11 +73,18 @@ test('does not refresh the API Key when the Lambda time budget is unsafe', async
   assert.equal(reader.calls, 1);
 });
 
-test('classifies SSM timeout, missing parameter and access denial separately', async () => {
+test('classifies SSM transport, service and permanent failures separately', async () => {
   for (const [outcome, classification] of [
     [{ name: 'TimeoutError' }, 'SSM_TRANSIENT'],
+    [{ name: 'Error', code: 'ECONNRESET' }, 'SSM_TRANSIENT'],
+    [{ name: 'Error', cause: { code: 'EAI_AGAIN' } }, 'SSM_TRANSIENT'],
+    [{ name: 'ThrottlingException', $metadata: { httpStatusCode: 429 } }, 'SSM_TRANSIENT'],
+    [{ name: 'InternalServerError', $metadata: { httpStatusCode: 500 } }, 'SSM_TRANSIENT'],
     [{ name: 'ParameterNotFound', $metadata: { httpStatusCode: 400 } }, 'AWS_RESOURCE_NOT_FOUND'],
     [{ name: 'AccessDeniedException', $metadata: { httpStatusCode: 403 } }, 'AWS_AUTHORIZATION'],
+    [{ name: 'ValidationException', $metadata: { httpStatusCode: 400 } }, 'AWS_CONFIGURATION'],
+    [{ name: 'CredentialsProviderError' }, 'AWS_CONFIGURATION'],
+    [{ name: 'Error' }, 'UNEXPECTED'],
   ] as const) {
     const client = { send: async () => { throw outcome; } } as unknown as SSMClient;
     await assert.rejects(() => new SsmParameterReader(client).getParameter('/parameter'), (error: unknown) =>

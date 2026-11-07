@@ -1,6 +1,6 @@
 import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
-import { DataCollectorError, awsErrorName, awsHttpStatus, awsPermanentError,
-  isAwsServerError, isAwsThrottling, isAwsTimeout } from './errors';
+import { DataCollectorError, awsErrorCode, awsErrorName, awsHttpStatus, awsPermanentError,
+  isAwsServerError, isAwsThrottling, isAwsTimeout, isAwsTransportError } from './errors';
 
 export interface MessageQueue {
   send(body: string): Promise<void>;
@@ -16,12 +16,14 @@ export class SqsMessageQueue implements MessageQueue {
       });
     } catch (error) {
       const name = awsErrorName(error);
+      const reason = awsErrorCode(error) ?? name;
       const status = awsHttpStatus(error);
       if (isAwsThrottling(name, status)) {
         throw new DataCollectorError('SQS_TRANSIENT', 'SQS throttled SendMessage', name, status, { cause: error });
       }
-      if (isAwsTimeout(name) || isAwsServerError(status) || status === undefined) {
-        throw new DataCollectorError('SQS_SEND_OUTCOME_UNKNOWN', 'SQS SendMessage outcome is unknown', name, status, { cause: error });
+      if (isAwsTimeout(name) || isAwsTransportError(error) || isAwsServerError(status)) {
+        throw new DataCollectorError('SQS_SEND_OUTCOME_UNKNOWN', 'SQS SendMessage outcome is unknown', reason, status,
+          { cause: error });
       }
       throw awsPermanentError('SQS SendMessage failed permanently', name, status, error);
     }

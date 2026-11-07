@@ -360,17 +360,17 @@ optional fieldは原則として使用せず、値が存在し得ないfieldは�
 | `AWS_AUTHORIZATION` | SSM、S3またはSQSのAccessDenied等 | 不可、IAM・Resource Policyを修正 |
 | `AWS_RESOURCE_NOT_FOUND` | Parameter、BucketまたはQueueが存在しない | 不可、Resource設定を修正 |
 | `AWS_CONFIGURATION` | Resource名、EndpointまたはRequest設定が不正 | 不可、設定を修正 |
-| `SSM_TRANSIENT` | SSM timeout、throttling、429、5xx | Backoff付きRetry |
-| `S3_TRANSIENT` | S3 timeout、5xx、継続する409 | Retry可 |
+| `SSM_TRANSIENT` | SSM timeout、既知の通信切断、throttling、429、5xx | Backoff付きRetry |
+| `S3_TRANSIENT` | S3 timeout、既知の通信切断、5xx、継続する409 | Retry可 |
 | `OUTBOX_CONFLICT` | 同一keyの内容またはrequest identity不整合 | 不可 |
 | `OUTBOX_INTEGRITY` | 保存済みbytesのSHA-256不一致 | 不可 |
 | `OUTBOX_EXPIRED` | 7日Lifecycle等によるobject欠落 | 不可、収集失敗 |
 | `SQS_TRANSIENT` | 明確な未送信となる一時障害 | 送信OperationだけRetry |
-| `SQS_SEND_OUTCOME_UNKNOWN` | timeout等で送信結果不明 | 同一Outboxを再送 |
+| `SQS_SEND_OUTCOME_UNKNOWN` | timeout、通信切断または5xxで送信結果不明 | 同一Outboxを再送 |
 | `COMMENT_ID_CONFLICT` | 同じIDで本文または投稿日時が異なる | 不可 |
 | `MESSAGE_TOO_LARGE` | 1コメントで921,600 bytesを超える | 不可 |
 | `TIME_BUDGET` | 安全な完了に必要な残り時間がない | Operation単位でRetry |
-| `UNEXPECTED` | 分類不能な内部障害 | 原則失敗、調査対象 |
+| `UNEXPECTED` | statusを持たない未知例外等の分類不能な内部障害 | 原則失敗、調査対象 |
 
 ログにはOperation、AWS Request ID、内部ID、Batch ID、Page ID、件数、byte数、
 HTTP status、機密情報を含まない外部API error reason、Retry回数および処理時間だけを記録する。

@@ -1,6 +1,6 @@
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
-import { DataCollectorError, awsErrorName, awsHttpStatus, awsPermanentError,
-  isAwsAuthorizationError, isAwsServerError, isAwsThrottling, isAwsTimeout } from './errors';
+import { DataCollectorError, awsErrorCode, awsErrorName, awsHttpStatus, awsPermanentError,
+  isAwsAuthorizationError, isAwsServerError, isAwsThrottling, isAwsTimeout, isAwsTransportError } from './errors';
 import { sha256 } from './serialization';
 
 export interface ObjectStore {
@@ -21,10 +21,11 @@ export class S3ObjectStore implements ObjectStore {
     } catch (error) {
       if (error instanceof DataCollectorError) throw error;
       const name = awsErrorName(error);
+      const reason = awsErrorCode(error) ?? name;
       const status = awsHttpStatus(error);
       if (name === 'NoSuchKey' || name === 'NotFound') return null;
-      if (isAwsTimeout(name) || isAwsThrottling(name, status) || isAwsServerError(status)) {
-        throw new DataCollectorError('S3_TRANSIENT', 'S3 GetObject failed transiently', name, status, { cause: error });
+      if (isAwsTimeout(name) || isAwsTransportError(error) || isAwsThrottling(name, status) || isAwsServerError(status)) {
+        throw new DataCollectorError('S3_TRANSIENT', 'S3 GetObject failed transiently', reason, status, { cause: error });
       }
       throw awsPermanentError('S3 GetObject failed permanently', name, status, error);
     }
@@ -43,17 +44,18 @@ export class S3ObjectStore implements ObjectStore {
         return 'stored';
       } catch (error) {
         const name = awsErrorName(error);
+        const reason = awsErrorCode(error) ?? name;
         const status = awsHttpStatus(error);
         if (name === 'PreconditionFailed' || status === 412) return 'exists';
         if ((name === 'ConditionalRequestConflict' || status === 409) && attempt === 0) continue;
-        if (name === 'ConditionalRequestConflict' || status === 409 || isAwsTimeout(name) ||
+        if (name === 'ConditionalRequestConflict' || status === 409 || isAwsTimeout(name) || isAwsTransportError(error) ||
             isAwsThrottling(name, status) || isAwsServerError(status)) {
-          throw new DataCollectorError('S3_TRANSIENT', 'S3 PutObject failed transiently', name, status, { cause: error });
+          throw new DataCollectorError('S3_TRANSIENT', 'S3 PutObject failed transiently', reason, status, { cause: error });
         }
         if (isAwsAuthorizationError(name, status) || status !== undefined) {
           throw awsPermanentError('S3 PutObject failed permanently', name, status, error);
         }
-        throw new DataCollectorError('S3_TRANSIENT', 'S3 PutObject outcome is unknown', name, status, { cause: error });
+        throw new DataCollectorError('UNEXPECTED', 'S3 PutObject failed unexpectedly', reason, status, { cause: error });
       }
     }
     throw new DataCollectorError('S3_TRANSIENT', 'S3 PutObject conflict did not resolve');

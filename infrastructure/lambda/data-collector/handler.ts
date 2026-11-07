@@ -3,8 +3,8 @@ import { S3Client } from '@aws-sdk/client-s3';
 import { SQSClient } from '@aws-sdk/client-sqs';
 import { Context } from 'aws-lambda';
 import { DataCollectorOutput } from './contracts';
-import { DataCollectorError, awsErrorName, awsHttpStatus, awsPermanentError,
-  isAwsServerError, isAwsThrottling, isAwsTimeout } from './errors';
+import { DataCollectorError, awsErrorCode, awsErrorName, awsHttpStatus, awsPermanentError,
+  isAwsServerError, isAwsThrottling, isAwsTimeout, isAwsTransportError } from './errors';
 import { consoleLogger, Logger } from './logging';
 import { executeOperation, OperationDependencies } from './operations';
 import { S3ObjectStore } from './outbox';
@@ -37,10 +37,12 @@ export class SsmParameterReader implements ParameterReader {
     } catch (error) {
       if (error instanceof DataCollectorError) throw error;
       const nameValue = awsErrorName(error);
+      const reason = awsErrorCode(error) ?? nameValue;
       const status = awsHttpStatus(error);
-      if (isAwsTimeout(nameValue) || isAwsThrottling(nameValue, status) || isAwsServerError(status)) {
+      if (isAwsTimeout(nameValue) || isAwsTransportError(error) || isAwsThrottling(nameValue, status) ||
+          isAwsServerError(status)) {
         throw new DataCollectorError('SSM_TRANSIENT', 'YouTube API Key could not be retrieved transiently',
-          nameValue, status, { cause: error });
+          reason, status, { cause: error });
       }
       throw awsPermanentError('YouTube API Key could not be retrieved', nameValue, status, error);
     }
