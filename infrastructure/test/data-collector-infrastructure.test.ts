@@ -50,17 +50,27 @@ test('creates encrypted Standard queue and DLQ with the designed retention and r
   assert.equal(dlq.Properties.SqsManagedSseEnabled, true);
 });
 
-test('Data Collector IAM is limited to logs, outbox objects, one queue and one parameter', () => {
+test('Data Collector IAM is limited to logs, prefix-scoped outbox access, one queue and one parameter', () => {
   const roles = template().findResources('AWS::IAM::Role');
   const role = Object.entries(roles).find(([, item]) => item.Properties?.RoleName === 'stream-insight-dev-data-collector');
   assert.ok(role);
   const policies = Object.values(template().findResources('AWS::IAM::Policy')).filter((item) =>
     item.Properties?.Roles?.some((entry: unknown) => JSON.stringify(entry) === JSON.stringify({ Ref: role[0] })));
   assert.equal(policies.length, 1);
-  const statements = policies[0].Properties.PolicyDocument.Statement as Array<{ Action: string | string[]; Resource: unknown }>;
+  const statements = policies[0].Properties.PolicyDocument.Statement as Array<{
+    Action: string | string[]; Resource: unknown; Condition?: unknown;
+  }>;
   const actions = statements.flatMap((item) => typeof item.Action === 'string' ? [item.Action] : item.Action).sort();
-  assert.deepEqual(actions, ['logs:CreateLogStream', 'logs:PutLogEvents', 's3:GetObject', 's3:PutObject',
+  assert.deepEqual(actions, ['logs:CreateLogStream', 'logs:PutLogEvents', 's3:GetObject', 's3:ListBucket', 's3:PutObject',
     'sqs:SendMessage', 'ssm:GetParameter'].sort());
+  const listBucket = statements.find((item) => item.Action === 's3:ListBucket');
+  assert.ok(listBucket);
+  assert.doesNotMatch(JSON.stringify(listBucket.Resource), /outbox\/\*/);
+  assert.deepEqual(listBucket.Condition, { StringLike: { 's3:prefix': ['outbox/*'] } });
+  const objectAccess = statements.find((item) => Array.isArray(item.Action) && item.Action.includes('s3:GetObject'));
+  assert.ok(objectAccess);
+  assert.deepEqual(objectAccess.Action, ['s3:PutObject', 's3:GetObject']);
+  assert.match(JSON.stringify(objectAccess.Resource), /outbox\/\*/);
   const resources = JSON.stringify(statements.map((item) => item.Resource));
   assert.match(resources, /outbox\/\*/);
   assert.match(resources, /CommentQueue/);

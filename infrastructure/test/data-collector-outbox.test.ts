@@ -23,6 +23,19 @@ class FakeS3Client {
 const store = (client: FakeS3Client): S3ObjectStore =>
   new S3ObjectStore(client as unknown as S3Client, 'bucket');
 
+test('S3 GetObject treats a missing key as absent and preserves authorization failures', async () => {
+  const missing = { send: async () => {
+    throw { name: 'NoSuchKey', $metadata: { httpStatusCode: 404 } };
+  } } as unknown as S3Client;
+  assert.equal(await new S3ObjectStore(missing, 'bucket').get('outbox/missing.json'), null);
+
+  const denied = { send: async () => {
+    throw { name: 'AccessDenied', $metadata: { httpStatusCode: 403 } };
+  } } as unknown as S3Client;
+  await assert.rejects(() => new S3ObjectStore(denied, 'bucket').get('outbox/missing.json'), (error: unknown) =>
+    error instanceof DataCollectorError && error.classification === 'AWS_AUTHORIZATION');
+});
+
 test('S3 conditional Put treats 412 as an existing immutable object', async () => {
   const client = new FakeS3Client([412]);
   assert.equal(await store(client).putIfAbsent('outbox/key.json', Buffer.from('{}')), 'exists');

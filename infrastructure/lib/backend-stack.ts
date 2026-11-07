@@ -69,6 +69,11 @@ export class BackendStack extends Stack {
       resources: [props.rawDataBucket.arnForObjects('outbox/*')],
     }));
     dataCollectorRole.addToPolicy(new PolicyStatement({
+      actions: ['s3:ListBucket'],
+      resources: [props.rawDataBucket.bucketArn],
+      conditions: { StringLike: { 's3:prefix': ['outbox/*'] } },
+    }));
+    dataCollectorRole.addToPolicy(new PolicyStatement({
       actions: ['sqs:SendMessage'],
       resources: [commentQueue.queueArn],
     }));

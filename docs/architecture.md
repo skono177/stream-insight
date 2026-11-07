@@ -654,6 +654,9 @@ Data Collector Lambdaには広いprincipalを許可するresource-based policy�
 IAM identity policyで対象State Machine実行Roleおよび明示した運用RoleだけにInvokeを許可する。
 Data Collector実行RoleにはAurora、
 `rds-db:*`、`rds-data:*`およびVPC ENI操作を許可しない。
+S3 Object操作は`outbox/*`への`GetObject`と`PutObject`に限定する。未作成Snapshotの`GetObject`を
+403ではなく404として判別するため、Bucket ARNへの`ListBucket`を別Statementで許可し、
+`s3:prefix=outbox/*`条件でOutbox以外の一覧取得を禁止する。
 
 この境界は悪意ある呼び出し元に対する暗号学的証明ではない。
 署名付き登録receiptやDB照会APIは既存Contract変更と複雑性を伴うためPoCでは採用しない。

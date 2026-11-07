@@ -888,7 +888,9 @@ Block Public Access: ON
 
 アクセスはIAM Roleを付与されたLambda等に限定する。
 
-VPC外のData Collector Lambdaには`outbox/`に対するPutObject / GetObjectだけを許可する。
+VPC外のData Collector Lambdaには`outbox/`に対するPutObject / GetObjectを許可する。
+未作成ObjectのGetObjectを404として判別するためBucket ARNへのListBucketも許可するが、
+`s3:prefix=outbox/*`条件でOutbox以外の一覧取得を禁止する。
 
 Analyzer LambdaからRaw Data Bucketへのアクセスは、
 S3 Gateway VPC Endpoint経由とする。
@@ -1748,6 +1750,9 @@ Secrets Manager Interface VPC Endpointは作成しない。
 ```text
 S3 PutObject / GetObject
 Resource: <Raw Data Bucket ARN>/outbox/*
+S3 ListBucket
+Resource: <Raw Data Bucket ARN>
+Condition: StringLike s3:prefix = outbox/*
 SQS SendMessage
 SSM GetParameter
 Resource: <API Key SecureString Parameter ARN>
@@ -1757,7 +1762,8 @@ CloudWatch Logs
 ```
 
 Data Collector Lambdaには`rds-db:*`、`rds-data:*`、Aurora管理者Secretへのアクセス、
-VPC ENI管理権限を付与しない。S3権限は`outbox/*`、SQS権限は対象Comment Queueだけに限定する。
+VPC ENI管理権限を付与しない。S3 Object権限は`outbox/*`に限定し、Bucketの`ListBucket`権限は
+`s3:prefix=outbox/*`条件で限定する。SQS権限は対象Comment Queueだけに限定する。
 
 ### Stream Metadata Lambda
 
@@ -2116,8 +2122,9 @@ Database endpoint、port、DB Cluster Resource ID、IAM connect grantおよびSe
 Data Collector Lambda用には、`BackendStackProps`へ`rawDataBucket: s3.IBucket`を追加し、
 StorageStackが`public readonly rawDataBucket`として公開するBucketを`stream-insight.ts`から渡す。
 Data Collectorの`RAW_DATA_BUCKET_NAME`には`rawDataBucket.bucketName`を設定する。
-実行Roleには対象Bucketの`outbox/*`に対する`s3:PutObject`と`s3:GetObject`だけを付与し、
-`raw/*`や他Bucketへの権限は付与しない。これによりBucket参照による
+実行Roleには対象Bucketの`outbox/*`に対する`s3:PutObject`と`s3:GetObject`を付与する。
+未作成Objectの404判別に必要な`s3:ListBucket`は対象Bucket ARNへの別Statementとし、
+`s3:prefix=outbox/*`条件を付ける。`raw/*`や他Bucketへの権限は付与しない。これによりBucket参照による
 BackendStack → StorageStackの既存依存関係へ統合し、名前による再検索や手動ARN構築を行わない。
 
 BackendStack内では`DatabaseMigration` Custom Resourceを参照可能なconstructとして保持し、
