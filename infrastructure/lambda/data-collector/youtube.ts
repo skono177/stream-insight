@@ -1,4 +1,4 @@
-import { DataCollectorError } from './errors';
+import { DataCollectorError, isAwsTransportError } from './errors';
 import { normalizeTimestamp } from './timestamps';
 
 export interface YouTubeVideo {
@@ -97,7 +97,7 @@ export class ApiKeyYouTubeClient implements YouTubeClient {
     }
     let body: unknown;
     try { body = await response.json(); } catch (error) {
-      throw new DataCollectorError(response.ok ? 'UNEXPECTED' : 'YOUTUBE_TRANSIENT',
+      throw new DataCollectorError(isAwsTransportError(error) || !response.ok ? 'YOUTUBE_TRANSIENT' : 'UNEXPECTED',
         'YouTube returned an invalid JSON response', undefined, response.status, { cause: error });
     }
     if (!response.ok) throw youtubeError(response.status, errorReason(body));

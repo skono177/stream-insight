@@ -7,6 +7,12 @@ const response = (body: unknown, status = 200): Response => new Response(JSON.st
   status, headers: { 'content-type': 'application/json' },
 });
 
+const responseWithJsonError = (error: unknown, status = 200): Response => ({
+  ok: status >= 200 && status < 300,
+  status,
+  json: async () => { throw error; },
+} as unknown as Response);
+
 function video(live: Record<string, unknown>): unknown {
   return { items: [{ id: 'video', snippet: { channelId: 'channel', channelTitle: 'name', title: 'title' },
     liveStreamingDetails: live }] };
@@ -59,11 +65,12 @@ test('uses x-goog-api-key header without placing the API Key in the URL', async 
   assert.equal(requestedHeaders?.get('x-goog-api-key'), 'secret-api-key');
 });
 
-test('classifies authentication, quota, 429 and live chat end errors', async () => {
+test('classifies authentication, quota, 429, 5xx and live chat end errors', async () => {
   for (const [status, reason, classification] of [
     [400, 'keyInvalid', 'YOUTUBE_AUTHENTICATION'],
     [403, 'quotaExceeded', 'YOUTUBE_QUOTA'],
     [429, 'rateLimitExceeded', 'YOUTUBE_TRANSIENT'],
+    [503, 'backendError', 'YOUTUBE_TRANSIENT'],
     [403, 'liveChatEnded', 'LIVE_CHAT_ENDED'],
     [403, 'liveChatDisabled', 'LIVE_CHAT_UNAVAILABLE'],
   ] as const) {
@@ -71,6 +78,25 @@ test('classifies authentication, quota, 429 and live chat end errors', async () 
     await assert.rejects(() => client.getComments('chat', null), (error: unknown) =>
       error instanceof DataCollectorError && error.classification === classification);
   }
+});
+
+test('classifies transport failures while reading a successful response body as transient', async () => {
+  const errors = [
+    Object.assign(new Error('connection reset'), { code: 'ECONNRESET' }),
+    Object.assign(new Error('body timed out'), { name: 'TimeoutError' }),
+    Object.assign(new Error('body failed'), {
+      cause: Object.assign(new Error('socket timed out'), { code: 'ETIMEDOUT' }),
+    }),
+  ];
+  for (const bodyError of errors) {
+    const client = new ApiKeyYouTubeClient('key', async () => responseWithJsonError(bodyError));
+    await assert.rejects(() => client.getVideo('video'), (error: unknown) =>
+      error instanceof DataCollectorError && error.classification === 'YOUTUBE_TRANSIENT');
+  }
+
+  const unknown = new ApiKeyYouTubeClient('key', async () => responseWithJsonError(new Error('unknown body failure')));
+  await assert.rejects(() => unknown.getVideo('video'), (error: unknown) =>
+    error instanceof DataCollectorError && error.classification === 'UNEXPECTED');
 });
 
 test('rejects timeout, non-JSON and malformed YouTube responses', async () => {
