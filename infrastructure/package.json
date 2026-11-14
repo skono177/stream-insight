@@ -4,10 +4,13 @@
   "private": true,
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node --test dist/test/data-api.test.js dist/test/migration-definition.test.js dist/test/migration-runner.test.js dist/test/migration-handler.test.js dist/test/stream-metadata-validation.test.js dist/test/stream-metadata-operations.test.js dist/test/stream-metadata-database.test.js dist/test/stream-metadata-errors.test.js dist/test/stream-metadata-infrastructure.test.js"
+    "test": "npm run build && node --test dist/test/data-api.test.js dist/test/data-collector-aws-errors.test.js dist/test/data-collector-handler.test.js dist/test/data-collector-infrastructure.test.js dist/test/data-collector-operations.test.js dist/test/data-collector-outbox.test.js dist/test/data-collector-serialization.test.js dist/test/data-collector-validation.test.js dist/test/data-collector-youtube.test.js dist/test/migration-definition.test.js dist/test/migration-runner.test.js dist/test/migration-handler.test.js dist/test/stream-metadata-validation.test.js dist/test/stream-metadata-operations.test.js dist/test/stream-metadata-database.test.js dist/test/stream-metadata-errors.test.js dist/test/stream-metadata-infrastructure.test.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.0.0",
     "@aws-sdk/client-rds-data": "^3.0.0",
+    "@aws-sdk/client-sqs": "^3.0.0",
+    "@aws-sdk/client-ssm": "^3.0.0",
     "@aws-sdk/rds-signer": "^3.1141.0",
     "aws-cdk-lib": "^2.0.0",
     "constructs": "^10.0.0",

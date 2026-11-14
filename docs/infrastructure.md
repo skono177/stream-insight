@@ -324,7 +324,7 @@ PoCでは以下のLambda Functionを作成する。
 役割：
 
 - YouTube Data APIへのアクセス
-- 検証済みの認証方式によるYouTube Data APIアクセス（初期候補はAPI Key）
+- 検証済みのAPI Key方式によるYouTube Data APIアクセス
 - 配信情報取得
 - Live Chat ID取得
 - コメント取得
@@ -364,8 +364,8 @@ MAX_MESSAGE_BODY_BYTES=921600
 NODE_OPTIONS=--enable-source-maps
 ```
 
-`YOUTUBE_AUTH_MODE`は公開・非所有ライブに対するAPI Key実地検証成功後に確定する。
-検証完了まではOAuth用Environment Variable、SecretおよびToken更新処理を追加しない。
+`YOUTUBE_AUTH_MODE`は公開・非所有ライブに対するAPI Key実地検証の成功結果に基づき、
+`API_KEY`に確定する。OAuth用Environment Variable、SecretおよびToken更新処理は追加しない。
 
 Data Collector LambdaはYouTube Data APIへアクセスするため、
 VPC外へ配置する。
@@ -888,7 +888,9 @@ Block Public Access: ON
 
 アクセスはIAM Roleを付与されたLambda等に限定する。
 
-VPC外のData Collector Lambdaには`outbox/`に対するPutObject / GetObjectだけを許可する。
+VPC外のData Collector Lambdaには`outbox/`に対するPutObject / GetObjectを許可する。
+未作成ObjectのGetObjectを404として判別するためBucket ARNへのListBucketも許可するが、
+`s3:prefix=outbox/*`条件でOutbox以外の一覧取得を禁止する。
 
 Analyzer LambdaからRaw Data Bucketへのアクセスは、
 S3 Gateway VPC Endpoint経由とする。
@@ -1659,13 +1661,18 @@ Data Collector LambdaはIAM Role経由で実行時に`GetParameter(WithDecryptio
 取得値をLambda実行環境内だけでキャッシュする。権限は対象Parameter ARNへ限定する。
 Customer Managed KMS Keyを使用する場合だけ、対象Keyへの`kms:Decrypt`も付与する。
 
+YouTube APIが認証エラーを返した場合はキャッシュを破棄し、同じLambda呼び出し内でSSMから
+1回だけ再取得する。再取得した値が旧値と同一ならAPIを再試行せず、異なる場合だけ1回再試行する。
+再取得とAPI再試行に必要な時間を確保できない場合は`TIME_BUDGET`でOperationを終了する。
+固定TTL方式は正常時のSSM呼び出し増加とTTL中の旧Key利用を避けるため採用しない。
+
 ### 13.2. YouTube OAuth 2.0
 
-公開・非所有ライブの取得ではAPI Keyを第一候補とするが、`liveChatMessages.list`のAPI Key対応は
-Google公式資料だけでは確定できない。`architecture.md`の4.3.10節に定義した実地検証が失敗した場合だけ、
-最小のread-only scopeによるOAuth 2.0方式を再検討する。
+公開・非所有ライブの取得では、`architecture.md`の4.3.10節に記録した実地検証結果に基づき
+API Key方式を採用する。API Key方式で認証・認可エラーが再現し、API設定やKey制限の問題を
+除外できた場合だけ、最小のread-only scopeによるOAuth 2.0方式を再検討する。
 
-認証方式確定まではOAuth Client、Refresh Token、Access Token取得処理およびOAuth用Secretを作成しない。
+OAuth Client、Refresh Token、Access Token取得処理およびOAuth用Secretは作成しない。
 OAuth方式を採用する場合は、Data Collector Lambdaから利用する認証情報を次の方針で安全に管理する。
 
 PoCでは初回認可を開発者または運用者が手動で実施する。
@@ -1743,6 +1750,9 @@ Secrets Manager Interface VPC Endpointは作成しない。
 ```text
 S3 PutObject / GetObject
 Resource: <Raw Data Bucket ARN>/outbox/*
+S3 ListBucket
+Resource: <Raw Data Bucket ARN>
+Condition: StringLike s3:prefix = outbox/*
 SQS SendMessage
 SSM GetParameter
 Resource: <API Key SecureString Parameter ARN>
@@ -1752,7 +1762,8 @@ CloudWatch Logs
 ```
 
 Data Collector Lambdaには`rds-db:*`、`rds-data:*`、Aurora管理者Secretへのアクセス、
-VPC ENI管理権限を付与しない。S3権限は`outbox/*`、SQS権限は対象Comment Queueだけに限定する。
+VPC ENI管理権限を付与しない。S3 Object権限は`outbox/*`に限定し、Bucketの`ListBucket`権限は
+`s3:prefix=outbox/*`条件で限定する。SQS権限は対象Comment Queueだけに限定する。
 
 ### Stream Metadata Lambda
 
@@ -2039,6 +2050,16 @@ infrastructure/
 CloudWatch LogsについてもCDK管理対象とし、
 保持期間およびRemoval Policyをコード上で明示する。
 
+### 16.1. CDKビルド依存の既知リスク
+
+レビュー時点では、`aws-cdk-lib@2.270.0`から`minimatch@10.2.5`、
+`brace-expansion@5.0.9`へ至る推移的依存にHigh 1件、Moderate 2件が報告された。
+同じlockfileで2026-11-07に`npm audit --omit=dev`を再実行した結果は0件であり、
+registry上のAdvisory評価が更新された可能性がある。ただし依存Version自体は変わっていない。
+これらはCDKのsynth・デプロイ用依存であり、Data Collector Lambdaのbundleには含まれない。
+後続Issueで`aws-cdk-lib`を更新し、全テスト、CDK synth、生成Template差分、依存経路および
+`npm audit`を再確認する。Issue #15では`npm overrides`、`npm audit fix --force`および依存更新を行わない。
+
 ---
 
 ## 17. CDK Stack構成
@@ -2101,8 +2122,9 @@ Database endpoint、port、DB Cluster Resource ID、IAM connect grantおよびSe
 Data Collector Lambda用には、`BackendStackProps`へ`rawDataBucket: s3.IBucket`を追加し、
 StorageStackが`public readonly rawDataBucket`として公開するBucketを`stream-insight.ts`から渡す。
 Data Collectorの`RAW_DATA_BUCKET_NAME`には`rawDataBucket.bucketName`を設定する。
-実行Roleには対象Bucketの`outbox/*`に対する`s3:PutObject`と`s3:GetObject`だけを付与し、
-`raw/*`や他Bucketへの権限は付与しない。これによりBucket参照による
+実行Roleには対象Bucketの`outbox/*`に対する`s3:PutObject`と`s3:GetObject`を付与する。
+未作成Objectの404判別に必要な`s3:ListBucket`は対象Bucket ARNへの別Statementとし、
+`s3:prefix=outbox/*`条件を付ける。`raw/*`や他Bucketへの権限は付与しない。これによりBucket参照による
 BackendStack → StorageStackの既存依存関係へ統合し、名前による再検索や手動ARN構築を行わない。
 
 BackendStack内では`DatabaseMigration` Custom Resourceを参照可能なconstructとして保持し、

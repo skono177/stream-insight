@@ -134,11 +134,11 @@ YouTubeから以下のデータを取得する。
 
 取得にはYouTube Data APIを利用する。
 
-公開・非所有ライブの読み取りではAPI Keyを第一候補とする。
-`videos.list`は公開情報の取得にAPI Keyを利用できるが、`liveChatMessages.list`については
-Google公式資料間でAPI Key対応の記述が一致していないため、実装開始前に4.3.10節の手順で実地検証する。
-検証に成功した場合はAPI Key方式を採用し、失敗した場合だけOAuth 2.0方式を再検討する。
-認証方式が確定するまでOAuth Client、Refresh TokenおよびAccess Token取得処理は実装しない。
+公開・非所有ライブの読み取りにはAPI Key方式を採用する。
+4.3.10節の実地検証で`videos.list`、`activeLiveChatId`取得、`liveChatMessages.list`、
+`nextPageToken`による継続取得および`pollingIntervalMillis`取得がOAuth 2.0なしで成功している。
+OAuth Client、Refresh TokenおよびAccess Token取得処理は実装せず、API Key方式で認証エラーが
+再現した場合だけOAuth 2.0方式を再検討する。
 
 ---
 
@@ -255,7 +255,7 @@ YouTube Data APIから対象配信のデータを取得する。
 
 主な責務：
 
-- 検証済みの認証方式によるYouTube Data APIアクセス（初期候補はAPI Key）
+- 検証済みのAPI Key方式によるYouTube Data APIアクセス
 - 終了時の最終メタデータ再取得（`videos.list`の`snippet,liveStreamingDetails`）
 - 配信情報取得
 - Live Chat ID取得
@@ -357,20 +357,30 @@ optional fieldは原則として使用せず、値が存在し得ないfieldは�
 | `LIVE_CHAT_UNAVAILABLE` | Live Chat無効・未取得・not found | 状態により待機または失敗 |
 | `LIVE_CHAT_ENDED` | Live Chat終了 | Retryせず終了処理へ進む |
 | `STREAM_START_TIMEOUT` | UPCOMINGの開始待ちが30分を超過 | Retryせず失敗 |
-| `S3_TRANSIENT` | S3 timeout、5xx、継続する409 | Retry可 |
+| `AWS_AUTHORIZATION` | SSM、S3またはSQSのAccessDenied等 | 不可、IAM・Resource Policyを修正 |
+| `AWS_RESOURCE_NOT_FOUND` | Parameter、BucketまたはQueueが存在しない | 不可、Resource設定を修正 |
+| `AWS_CONFIGURATION` | Resource名、EndpointまたはRequest設定が不正 | 不可、設定を修正 |
+| `SSM_TRANSIENT` | SSM timeout、既知の通信切断、throttling、429、5xx | Backoff付きRetry |
+| `S3_TRANSIENT` | S3 timeout、既知の通信切断、5xx、継続する409 | Retry可 |
 | `OUTBOX_CONFLICT` | 同一keyの内容またはrequest identity不整合 | 不可 |
 | `OUTBOX_INTEGRITY` | 保存済みbytesのSHA-256不一致 | 不可 |
 | `OUTBOX_EXPIRED` | 7日Lifecycle等によるobject欠落 | 不可、収集失敗 |
 | `SQS_TRANSIENT` | 明確な未送信となる一時障害 | 送信OperationだけRetry |
-| `SQS_SEND_OUTCOME_UNKNOWN` | timeout等で送信結果不明 | 同一Outboxを再送 |
+| `SQS_SEND_OUTCOME_UNKNOWN` | timeout、通信切断または5xxで送信結果不明 | 同一Outboxを再送 |
 | `COMMENT_ID_CONFLICT` | 同じIDで本文または投稿日時が異なる | 不可 |
 | `MESSAGE_TOO_LARGE` | 1コメントで921,600 bytesを超える | 不可 |
 | `TIME_BUDGET` | 安全な完了に必要な残り時間がない | Operation単位でRetry |
-| `UNEXPECTED` | 分類不能な内部障害 | 原則失敗、調査対象 |
+| `UNEXPECTED` | statusを持たない未知例外等の分類不能な内部障害 | 原則失敗、調査対象 |
 
 ログにはOperation、AWS Request ID、内部ID、Batch ID、Page ID、件数、byte数、
 HTTP status、機密情報を含まない外部API error reason、Retry回数および処理時間だけを記録する。
 API Key、OAuth情報、YouTube APIレスポンス全体、コメント本文、SQS MessageBodyおよびLambda event全体は記録しない。
+
+API KeyはLambda実行環境内でキャッシュするが、YouTube APIが認証エラーを返した場合は
+キャッシュを破棄してSSMから1回だけ再取得する。再取得値が同一ならYouTube APIを再呼び出しせず、
+異なる場合だけ1回再試行する。残り時間が22秒以下なら再取得せず`TIME_BUDGET`とする。
+これによりローテーションをwarm環境へ反映しつつ、設定不備時の無制限Retryを防ぐ。
+固定TTLは正常呼び出しでも定期的なSSMアクセスを生じさせる一方、TTL満了までは旧Keyを使うため採用しない。
 
 #### 4.3.2. `GET_STREAM_METADATA`
 
@@ -644,6 +654,9 @@ Data Collector Lambdaには広いprincipalを許可するresource-based policy�
 IAM identity policyで対象State Machine実行Roleおよび明示した運用RoleだけにInvokeを許可する。
 Data Collector実行RoleにはAurora、
 `rds-db:*`、`rds-data:*`およびVPC ENI操作を許可しない。
+S3 Object操作は`outbox/*`への`GetObject`と`PutObject`に限定する。未作成Snapshotの`GetObject`を
+403ではなく404として判別するため、Bucket ARNへの`ListBucket`を別Statementで許可し、
+`s3:prefix=outbox/*`条件でOutbox以外の一覧取得を禁止する。
 
 この境界は悪意ある呼び出し元に対する暗号学的証明ではない。
 署名付き登録receiptやDB照会APIは既存Contract変更と複雑性を伴うためPoCでは採用しない。
@@ -673,7 +686,7 @@ YouTube API応答と最初のS3保存は同一トランザクションにでき�
 `videos.list`は公開動画の`snippet,liveStreamingDetails`取得にAPI Keyを使用する。
 `liveChatMessages.list`はGoogle公式のData API共通説明およびLive Chat streaming sampleでは
 API Keyを利用可能と読める一方、Live Streaming APIのCredential説明には全methodでOAuth必須との記載がある。
-そのため、公開・非所有ライブに対して次の実地検証を行うまでAPI Key方式を確定しない。
+この公式資料間の差異を解消するため、公開・非所有ライブに対して次の実地検証を行った。
 
 根拠とするGoogle公式資料：
 
@@ -691,7 +704,10 @@ API Keyを利用可能と読める一方、Live Streaming APIのCredential説明
 6. 200応答と必要fieldに加え、配信終了時に`offlineAt`または`liveChatEnded`を確認できればAPI Key方式を採用する
 7. 認証・認可エラーになる場合は最小のread-only scopeによるOAuth方式を再検討する
 
-検証完了までOAuth Client、Refresh Token管理およびToken更新処理を実装しない。
+検証では、API Keyだけで`videos.list`がHTTP 200となり、`activeLiveChatId`を取得できた。
+同じAPI Keyによる`liveChatMessages.list`もHTTP 200となり、初回74件、2回目3件のコメント、
+`nextPageToken`および`pollingIntervalMillis`を取得できた。この結果に基づきAPI Key方式を採用する。
+OAuth Client、Refresh Token管理およびToken更新処理は実装しない。
 
 ---
 

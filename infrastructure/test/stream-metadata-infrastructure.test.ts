@@ -15,7 +15,7 @@ function templates(): { backend: Template; storage: Template; network: Template 
   const network = new NetworkStack(app, 'network', { env });
   const storage = new StorageStack(app, 'storage', { env, vpc: network.vpc });
   const backend = new BackendStack(app, 'backend', { env, databaseCluster: storage.databaseCluster,
-    vpc: network.vpc, applicationSecurityGroup: network.applicationSecurityGroup });
+    rawDataBucket: storage.rawDataBucket, vpc: network.vpc, applicationSecurityGroup: network.applicationSecurityGroup });
   cachedTemplates = { backend: Template.fromStack(backend), storage: Template.fromStack(storage), network: Template.fromStack(network) };
   return cachedTemplates;
 }
