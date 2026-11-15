@@ -2052,13 +2052,25 @@ CloudWatch LogsについてもCDK管理対象とし、
 
 ### 16.1. CDKビルド依存の既知リスク
 
-レビュー時点では、`aws-cdk-lib@2.270.0`から`minimatch@10.2.5`、
-`brace-expansion@5.0.9`へ至る推移的依存にHigh 1件、Moderate 2件が報告された。
-同じlockfileで2026-11-07に`npm audit --omit=dev`を再実行した結果は0件であり、
-registry上のAdvisory評価が更新された可能性がある。ただし依存Version自体は変わっていない。
-これらはCDKのsynth・デプロイ用依存であり、Data Collector Lambdaのbundleには含まれない。
-後続Issueで`aws-cdk-lib`を更新し、全テスト、CDK synth、生成Template差分、依存経路および
-`npm audit`を再確認する。Issue #15では`npm overrides`、`npm audit fix --force`および依存更新を行わない。
+Issue #18で、CDK開発環境をNode.js 22以降とし、`aws-cdk-lib@2.277.0`、
+`aws-cdk@2.1148.1`へ更新した。`aws-cdk-lib`にbundleされる依存は
+`minimatch@10.2.6`、`brace-expansion@5.0.13`となる。
+
+`brace-expansion@5.0.13`は、以下のAdvisoryの修正版をすべて満たす。
+
+- `GHSA-6j4f-fj2g-mc7p`（5.0.10で修正）
+- `GHSA-qhr7-859c-m2p7`（5.0.11で修正）
+- `GHSA-q2hr-2g5m-vwhr`（5.0.12で修正）
+
+一方、`minimatch@10.2.6`は`GHSA-g3hv-75wg-m249`の影響範囲
+（`>=7.0.0 <11.0.1`）に含まれる。上流修正PR `aws/aws-cdk#39595`は
+2026-11-13にmainへマージ済みだが、2026-11-15時点の最新安定版2.277.0には未収録である。
+`minimatch`は`aws-cdk-lib`のbundle dependencyであり利用側の`npm overrides`では解消できないため、
+同PRを含む最初の安定版が公開された時点で再更新する。
+
+対象パッケージはCDKのsynth・デプロイ環境だけで使用され、Lambda bundleには含まれない。
+本プロジェクトは外部入力をCDKのglob patternとして処理しないため実運用上の露出は限定的だが、
+Advisory自体は未解消として管理する。`npm audit --omit=dev`が0件の場合も、個別Advisoryとの照合を優先する。
 
 ---
 
